@@ -951,6 +951,72 @@ async def test_overpass_falls_over_to_the_next_mirror(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+async def test_a_mirror_failing_transiently_hands_over_to_the_next(status, monkeypatch):
+    """502 is the one that bit us: only 429 and 504 used to count as "try the
+    next one", so a bad gateway on the first mirror sank a search the second
+    mirror could have answered."""
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(status, text="")
+        return httpx.Response(200, json={"elements": [{
+            "type": "node", "id": 7,
+            "tags": {"name": "Kestrel Exteriors", "craft": "roofer"},
+        }]})
+
+    provider = D.OpenStreetMap()
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {}, D.DiscoveryQuery(
+            term="roofer", coordinate="39.7,-104.9,40"))
+    assert [b.name for b in out] == ["Kestrel Exteriors"]
+    assert seen == list(D.OpenStreetMap.ENDPOINTS[:2]), "the first mirror's failure should not have been fatal"
+
+
+@pytest.mark.asyncio
+async def test_every_mirror_failing_is_an_error_that_names_the_cause(monkeypatch):
+    """Throttling is not the only way the free mirrors go away, and the error
+    a user reads has to be true of what actually happened."""
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    statuses = iter((502, 503, 500))
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(next(statuses), text="")
+
+    provider = D.OpenStreetMap()
+    with pytest.raises(RuntimeError, match="unavailable or throttling"):
+        async with _client(handler) as client:
+            await provider.fetch(client, {}, D.DiscoveryQuery(
+                term="roofer", coordinate="39.7,-104.9,40"))
+    assert seen == list(D.OpenStreetMap.ENDPOINTS), "every mirror should be tried"
+
+
+@pytest.mark.asyncio
+async def test_a_query_the_mirrors_reject_fails_at_the_first_one(monkeypatch):
+    """A 400 means our query is wrong, not that the mirror is having a bad
+    day. Asking two more volunteer servers the same bad question wastes their
+    bandwidth and buries the real error under a retry story."""
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(400, text="malformed query")
+
+    provider = D.OpenStreetMap()
+    with pytest.raises(httpx.HTTPStatusError):
+        async with _client(handler) as client:
+            await provider.fetch(client, {}, D.DiscoveryQuery(
+                term="roofer", coordinate="39.7,-104.9,40"))
+    assert seen == list(D.OpenStreetMap.ENDPOINTS[:1]), "a rejected query is not a mirror problem"
+
+
+@pytest.mark.asyncio
 async def test_overpass_needs_a_coordinate_and_says_so(caplog):
     provider = D.OpenStreetMap()
     async with _client(lambda r: httpx.Response(200, json={})) as client:

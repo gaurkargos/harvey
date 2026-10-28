@@ -1052,6 +1052,11 @@ class OpenStreetMap(DiscoveryProvider):
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
     MIN_INTERVAL = 2.0
     BACKOFF = 5.0
+    # Statuses that say "this mirror, right now" rather than "this query":
+    # throttling, a gateway that lost its backend, an overloaded instance, a
+    # timed-out one. Every one of them is another mirror's problem to solve, so
+    # walk on. A 400 (bad query) or 404 is ours and fails here and now.
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
     TAG_MAP = {
@@ -1102,9 +1107,10 @@ class OpenStreetMap(DiscoveryProvider):
         )
         body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
 
-        # Overpass is a free volunteer service and 429s/504s readily under
-        # load. Walk the mirrors, then RAISE: returning [] would make a
-        # throttled run look exactly like a market with no businesses in it.
+        # Overpass is a free volunteer service and throttles, 502s and times
+        # out readily under load. Walk the mirrors, then RAISE: returning []
+        # would make a throttled run look exactly like a market with no
+        # businesses in it.
         headers = {"User-Agent": "Harvey/0.1 (open-source sales agent; "
                                  "github.com/ethanplusai/harvey)"}
         r = None
@@ -1117,15 +1123,15 @@ class OpenStreetMap(DiscoveryProvider):
             except httpx.HTTPError as e:
                 logger.warning("osm: %s unreachable (%s)", endpoint, e)
                 continue
-            if r.status_code not in (429, 504):
+            if r.status_code not in self.RETRY_STATUSES:
                 break
-            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
-                           endpoint, r.status_code)
+            logger.warning("osm: %s is throttling or down (%s) — trying the "
+                           "next mirror", endpoint, r.status_code)
         else:
             raise RuntimeError(
-                "Every public Overpass mirror is throttling right now. This is "
-                "free volunteer infrastructure — wait a few minutes and re-run, "
-                "or use a paid provider for bulk work.")
+                "Every public Overpass mirror is unavailable or throttling "
+                "right now. This is free volunteer infrastructure — wait a few "
+                "minutes and re-run, or use a paid provider for bulk work.")
         if r is None:
             raise RuntimeError("Could not reach any Overpass mirror.")
         r.raise_for_status()
