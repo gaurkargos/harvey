@@ -289,7 +289,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
-    analyst = Analyst(state)
+    analyst = Analyst(state, config)
 
     interval = config.usage.heartbeat_interval_minutes * 60
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
