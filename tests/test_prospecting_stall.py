@@ -194,3 +194,110 @@ async def test_an_auto_reply_is_handed_to_a_human_not_left_open(tmp_path, monkey
     await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
     assert await state.get_conversations_by_status("open") == []
     assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
+
+
+# ── Review follow-ups ──
+
+async def _handler(tmp_path, monkeypatch, intents):
+    from harvey.agents.handler import Handler
+    from tests.test_do_not_contact import FakeProvider
+    from tests.test_outbox_native import Cfg, Env, seed_prospect
+    state = StateManager(str(tmp_path / "back.db"))
+    await state.init_db()
+    pid = await seed_prospect(state, email="jane@acme.example", status="contacted")
+    handler = Handler(brain=None, state=state, config=Cfg(), env=Env())
+    handler.provider = FakeProvider()
+    queue = list(intents)
+
+    async def _intent(*a, **k):
+        return queue.pop(0)
+
+    async def _answer(*a, **k):
+        return "Happy to."
+    monkeypatch.setattr(handler, "_classify_intent", _intent)
+    monkeypatch.setattr(handler, "_generate_response", _answer)
+    return state, handler, pid
+
+
+async def _all_conversations(state):
+    found = []
+    for status in ("open", "needs_human", "closed"):
+        found += await state.get_conversations_by_status(status)
+    return found
+
+
+@pytest.mark.asyncio
+async def test_a_real_reply_after_an_auto_reply_continues_the_same_conversation(tmp_path, monkeypatch):
+    state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "interested"])
+    await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
+    await handler._process_reply("jane@acme.example", "Back now. Tell me more.", "u2")
+
+    convos = await _all_conversations(state)
+    assert len(convos) == 1
+    assert [m.content for m in convos[0].thread if m.sender == "prospect"] == [
+        "I'm away until Monday.", "Back now. Tell me more."]
+    assert convos[0].status == "open"
+
+
+@pytest.mark.asyncio
+async def test_a_second_auto_reply_keeps_one_conversation_with_you(tmp_path, monkeypatch):
+    state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "ooo"])
+    await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
+    await handler._process_reply("jane@acme.example", "Still away.", "u2")
+
+    convos = await _all_conversations(state)
+    assert len(convos) == 1 and convos[0].status == "needs_human"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_after_an_escalation_stays_with_you(tmp_path, monkeypatch):
+    # Only an auto-reply's hand-off reopens: an angry thread is never resumed.
+    state, handler, pid = await _handler(tmp_path, monkeypatch, ["escalate", "interested"])
+    await handler._process_reply("jane@acme.example", "Stop this now.", "u1")
+    await handler._process_reply("jane@acme.example", "Tell me more.", "u2")
+
+    first = (await state.get_conversations_by_status("needs_human"))[0]
+    assert [m.content for m in first.thread if m.sender == "prospect"] == ["Stop this now."]
+
+
+def _instantly_with_a_draft_and_an_open_conversation(monkeypatch, state, calls, stop, read_ok):
+    from tests.test_send_window import BASE, _patch_heartbeat
+    from harvey.agents import handler as handler_mod, sender as sender_mod
+    from harvey.config import HarveyConfig
+    cfg = HarveyConfig(**BASE, channels={"email": {"provider": "instantly", "require_approval": False}})
+    main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
+    monkeypatch.setattr(main_mod, "in_quiet_hours", lambda c: False)
+    monkeypatch.setattr(sender_mod.Sender, "is_native", False)
+
+    async def read(self):
+        calls.append("replies")
+        return read_ok
+    monkeypatch.setattr(handler_mod.Handler, "run", read)
+    return main_mod
+
+
+async def _draft_and_open_conversation(state):
+    from harvey.models.campaign import Campaign
+    from harvey.models.conversation import Conversation
+    await state.add_campaign(Campaign(id="", name="c"))
+    await state.add_conversation(Conversation(id="", prospect_id="p", campaign_id="", channel="email"))
+
+
+@pytest.mark.asyncio
+async def test_replies_are_read_before_a_campaign_deploys_with_a_conversation_open(state, monkeypatch):
+    import asyncio
+    await _draft_and_open_conversation(state)
+    calls, stop = [], asyncio.Event()
+    main_mod = _instantly_with_a_draft_and_an_open_conversation(monkeypatch, state, calls, stop, True)
+    await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
+    assert calls == ["replies", "send"]
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_waits_when_replies_could_not_be_read(state, monkeypatch):
+    import asyncio
+    await _draft_and_open_conversation(state)
+    calls, stop = [], asyncio.Event()
+    main_mod = _instantly_with_a_draft_and_an_open_conversation(monkeypatch, state, calls, stop, False)
+    await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
+    assert calls == ["replies"]

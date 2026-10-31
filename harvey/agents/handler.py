@@ -502,11 +502,16 @@ class Handler:
         # so the thread never gets the message twice or its stage advanced
         # twice. (Stop-on-reply above is idempotent and stays first.)
         existing_convos = await self.state.get_conversations_by_status("open")
+        # An auto-reply's hand-off is still the same conversation: what they
+        # write when they're back belongs in it. Other hand-offs stay handed off.
+        existing_convos += [c for c in await self.state.get_conversations_by_status("needs_human")
+                            if c.intent == "ooo"]
         stored = next(
             (c for c in existing_convos if c.prospect_id == prospect.id), None
         )
         if stored is not None:
             convo = stored.model_copy(deep=True)
+            convo.status = "open"
         else:
             convo = Conversation(
                 id="",
@@ -542,6 +547,7 @@ class Handler:
                 thread_json=convo.thread_json(),
                 intent=intent,
                 stage=convo.stage,
+                status=convo.status,
             )
         if convo.stage != old_stage:
             logger.info(f"Handler: Stage for {lead_email}: {old_stage} -> {convo.stage}")
