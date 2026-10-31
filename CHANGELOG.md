@@ -9,6 +9,37 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Your own email shape** (`writer.email_rules`). Point it at a markdown file
+  (`skills/email_rules.md` is gitignored) and its rules replace the Writer's
+  built-in shape, which ends every prompt and so beat anything in the skills:
+  email 1 under 75 words, an observation and a question, no pitch, no link.
+  It covers the per-person first email and the 3-email sequence. It never
+  lifts the FACTS rule, and the send gate (220 words, one link,
+  do-not-contact) still applies. The prompt now says what Harvey really adds
+  when it sends: with `compliance.opt_out_line` set, the draft gets no second
+  opt-out sentence; with it empty, an opt-out sentence the rules ask for is
+  written into the body. A file that's set but missing, empty or too long
+  stops the Writer, so it never drafts in the shape you replaced. Unset,
+  nothing changes.
+
+- **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
+  listings around each city, with phone, website, category, rating and review
+  count, and Google organic results with rank, both from one
+  `SCAVIO_API_KEY`. Maps is 1 credit per 20 businesses and Search 1 credit per
+  10 results; estimates use the $0.01 pay-as-you-go credit price. Off unless
+  you pick one in `harvey discover` or the dashboard. Closes #28.
+- **Sent emails on the Conversations tab.** A new *Awaiting reply* filter
+  lists people Harvey recently emailed who haven't answered yet (from its
+  latest 2,000 sent emails), with each sent
+  email and when it went out, so the tab shows every outbound thread instead
+  of only the ones that got a reply. When a reply arrives the card is
+  replaced by the real conversation, which already shows those emails. The
+  cards are read-only and create no conversation rows. The API change is
+  opt-in: `/api/conversations?awaiting=1` adds them, and the endpoint without
+  the parameter returns exactly what it did before. *Open* still means reply
+  conversations only. A card for a general inbox (no person's name) shows
+  the company name instead of "Unknown". People who replied, opted out or
+  bounced, and colleagues of anyone who replied, aren't listed.
 - **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
   keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
   (or the new warmup step on the dashboard's setup checklist) checks a key and
@@ -22,9 +53,8 @@ minor versions can still change behaviour.
   approach. A domain covers its subdomains, matched on a label boundary, so
   `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
   alone — a plain suffix test would catch the wrong company. The check runs
-  in `pre_send_check` rather than during discovery, so it is the last thing
-  before an email leaves and holds for one a human already approved in the
-  Outbox. It applies to replies as well as cold mail: a list that lets
+  in `pre_send_check`, so it is the last thing before an email leaves and
+  holds for one a human already approved in the Outbox. It applies to replies as well as cold mail: a list that lets
   automated replies through is not a do-not-contact list, and the operator
   can still answer by hand. Entries are normalised when the config loads, so
   ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
@@ -35,6 +65,21 @@ minor versions can still change behaviour.
   Instantly, which has no Outbox, listed leads are left out of the upload
   and a reply to one goes to you; a lead Instantly already has must be
   removed there.
+
+- **Discovery skips do-not-contact companies too.** The same
+  `compliance.do_not_contact` list is now applied while discovering, before a
+  result becomes a company, so a forbidden business never enters the pool: it
+  costs nothing to enrich, never has its site read, and stops turning up in
+  cohorts for someone to spot by eye. The send-time gate is unchanged and
+  still the last word — only it can stop a send — but on its own it let a
+  competitor through discovery and charged you for the enrichment first.
+  Discovery has a domain, not an address, so only domain entries apply here:
+  `jane@acme.example` bars one mailbox, and acme.example stays discoverable
+  because a colleague there may still be worth reaching. Skipped companies
+  are counted separately from junk, and `harvey discover` prints the count
+  only when it isn't zero — junk asks whether a result is a business at all,
+  this asks whether you are allowed to approach one, and burying the second
+  in the first is how a list that has grown too broad goes unnoticed.
 
 - **TinyFish as a free discovery source** (from #95). `harvey discover
   --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses
@@ -168,17 +213,48 @@ minor versions can still change behaviour.
   Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
 - **The Today page and `harvey status` say when Precleared is holding cold
   email.** When the check can't be made (its free checks for the day are used
-  up, the key is out of checks or was rejected, or Precleared can't be
-  reached), cold email still waits and replies still go out, but this used to
-  reach only the log, so cold email just went out slower. Harvey now records
-  the hold, and the Today page and `harvey status` say how many cold emails
-  are waiting and what fixes it: a free key, a pack for that key (the checkout
-  link from Precleared's answer), or nothing but time. The next fresh answer
-  clears it, a hold not seen for a day is ignored, and switching the check
-  off clears it. (from #57 by gabrielaoimevbore-beep)
+  up, the key is out of checks, was rejected or is being rate limited, or
+  Precleared can't be reached), cold email to new addresses waits and replies
+  still go out, but this used to reach only the log, so cold email just went
+  out slower. Harvey now records the hold, and the Today page and
+  `harvey status` say how many cold emails are waiting and what fixes it: a
+  free key, a pack for that key (the checkout link from Precleared's answer),
+  or nothing but time. The next fresh answer clears it, a hold not seen for a
+  day is ignored, and switching the check off clears it. (from #57 by
+  gabrielaoimevbore-beep)
 
 ### Changed
 
+- **Precleared is told the company's and person's names Harvey already has.**
+  For a UK address, cold email may go to a limited company's staff without
+  consent but not to a sole trader, so Precleared has to find the company
+  behind the domain on the Companies House register. When the domain alone
+  didn't find it, the answer was `consent_needed`, even for a company Harvey
+  knew the name of. Harvey now sends `company_name` (the company record's
+  name, else the prospect's company field) and `recipient_name` (the
+  prospect's first and last name; none for a company inbox), which
+  Precleared uses to search the register and match the company's officers.
+  It doesn't store the person's name. The names join the cache fingerprint
+  only when set: a cached `ok_to_email` stands when they first arrive, and
+  any other cached verdict gets one fresh check with them.
+- **Precleared is told the recipient's country Harvey already knows.** The
+  send window works out where a company is (a country, US state, Canadian
+  province or Australian state in its location, or a code that is a state
+  and a country too once the cached coordinates settle it); the compliance
+  check used to ask Precleared about the address with none of it, so
+  Precleared had to find the country again and, when it couldn't, answered
+  `unknown` and the email failed. Harvey now sends that country as
+  `recipient_country` when it is sure of it, which Precleared takes as
+  settled. Nothing it is not sure of is sent: "Berlin, DE" with no
+  coordinates reads as Delaware by convention and goes without a country,
+  as do a bare city and coordinates alone. Without a certain country,
+  `prospect_country` goes as the default, as before, and with that unset
+  the one country every `icp.geography` entry is in now serves as that
+  default; Precleared uses a default only when its own lookups show
+  nothing. The country joins the cache fingerprint only when it is set, so
+  cached verdicts are kept, and an address Harvey later becomes sure of is
+  re-checked once unless Precleared had found the same country itself.
+  `docs/precleared.md` describes the check in full.
 - **Setup comes first on Today.** Until setup is finished, the checklist sits at
   the top of the Today page as a "Finish setting up Harvey" card, with the next
   step highlighted, instead of at the bottom of the side column.
@@ -212,6 +288,22 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **OpenStreetMap discovery survives a bad afternoon** (from #125). A 500, 502 or
+  503 from one Overpass mirror now moves on to the next instead of ending the
+  search, Overpass gets enough time to get through its queue, and the mirror
+  list drops one that was the same machine as another. `scripts/diagnose_overpass.py`
+  re-checks the mirrors.
+- **Hebrew opt-outs are honored without the model** (from #134). A reply like
+  "הסר", "תורידו אותי מהרשימה" or "לא תודה" now opts out as its English
+  equivalent does, and `compliance.opt_out_line` can ask for a Hebrew reply.
+- **Harvey keeps prospecting when it can't send or is waiting on a reply**
+  (from #128, #126). A draft that couldn't deploy (email channel off, or native
+  sending paused) or any open conversation used to win every cycle, so Harvey
+  stopped writing and finding prospects. Replies are now read alongside
+  whatever the cycle does, still before anything is sent. An auto-reply now
+  goes to **Needs you**. A conversation handed to you stays with you: later
+  replies join it and Harvey doesn't answer them until you hand it back. Before,
+  a reply after an escalation started a new conversation Harvey could answer.
 - **Replies remember the whole conversation** (closes #97). A reply was
   written from the last six messages only, so a requirement the prospect
   stated earlier ("synthetic data only, processed in the EU") dropped out
@@ -462,11 +554,17 @@ minor versions can still change behaviour.
   have each new recipient checked before the first cold email against UK
   PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
   verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made (daily allowance used up, network down, a
-  malformed response), cold emails wait for a later cycle while replies still
-  go out. One check per address, cached for 30 days; changing the sender
-  country, address source or product description triggers a fresh check. The
-  receipt id is logged with each send. Native providers only. Off by default.
+  step. If the check can't be made because of Precleared (daily allowance or
+  rate limit, a bad key, network down, an unreadable answer), new addresses
+  wait for a later cycle while email to people already cleared, and replies,
+  still go out; if it fails for one address, only that email is moved back
+  six hours (failures at two different domains with no answer in between
+  hold new addresses too), and an address whose check timed out or got an
+  answer Harvey can't read is moved back as well, so it can't keep the
+  others waiting. One check per address, cached for 30 days; changing the
+  sender country, address source or product description triggers a fresh
+  check. The receipt id is logged with each send. Native providers only. Off
+  by default.
 - **`harvey setup` offers the Precleared check** (from #46 by
   gabrielaoimevbore-beep). A new optional last step
   asks whether to turn the check on, where your business is based (GB or US)
