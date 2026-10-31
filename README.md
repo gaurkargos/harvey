@@ -13,10 +13,9 @@ $ harvey run
 Harvey is online. Always Be Closing.
 ============================================================
 Checking pipeline state...
-Decision: handle_replies (2 new replies)
+Decision: write_campaign (3 new prospects with no drafts)
   handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
   handler   → Priya Nair, Highline Roofing         objection, answer drafted
-Decision: write_campaign (3 new prospects with no drafts)
   writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
   outbox    → 5 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
@@ -149,6 +148,52 @@ harvey dashboard          # prints a private link to http://127.0.0.1:5555
 harvey run
 ```
 
+### Or deploy with Docker (Linux)
+
+Docker Compose runs the dashboard; start and stop the heartbeat from its
+Actions card. Host networking preserves the dashboard's loopback-only bind at
+`127.0.0.1:5555`. This Compose setup supports native Linux; use the pip install
+above on macOS or Windows. On a remote Linux host, reach the dashboard through
+an SSH tunnel rather than exposing its port to the network.
+
+```bash
+git clone https://github.com/ethanplusai/harvey.git
+cd harvey
+
+# Create the credentials file only if you do not already have one.
+test -e .env || cp .env.example .env
+
+# Run as your Linux user, never root. Set these again when rebuilding.
+export HARVEY_UID=$(id -u) HARVEY_GID=$(id -g)
+
+# Sign in to Claude on the host first; ~/.claude must already exist.
+# The image ships Claude only; Codex is not included.
+docker compose build
+docker compose run --rm harvey setup
+
+docker compose up -d
+docker compose logs harvey
+# Open the private unlock link printed in the logs.
+```
+
+Compose mounts the checkout directory at `/app`. Setup credentials, both YAML
+config files, training output, knowledge files, and `data/` remain in that
+checkout when containers are recreated. Directory mounting also permits atomic
+configuration saves; do not replace it with individual config-file mounts.
+Harvey loads `.env` directly. Restart the container after editing credentials.
+The checkout and Claude auth directory must be writable by the selected user.
+
+To train later, use `docker compose run --rm harvey train <product-url>`;
+`harvey.local.yaml` is saved directly to the checkout. Back up this file, `.env`,
+`skills/`, and `data/` before moving installations. The running code also comes
+from the checkout: restart after updating it, and rebuild when dependencies or
+the Dockerfile change. The build context excludes local data and credentials.
+
+The dashboard listens on 5555. If you change the port in the Compose `command`,
+change the Dockerfile health-check port too and rebuild. Stop the service with
+`docker compose down`; its files remain in the checkout. Use a host install if
+you need the Codex provider.
+
 ---
 
 ## You confirm what it looks for
@@ -218,6 +263,8 @@ harvey discover               # go
 | **DataForSEO SERP** | $0.006 / search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Organic rank as the buying signal, plus who holds the local 3-pack, searched from the city centre. |
 | **DataForSEO Google Maps** | $0.002 / search (up to 100 results) | $1 credit + free sandbox | Map rank, rating, category and claimed status, including businesses with no website. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
+| **Scavio Google Maps** | $0.01 / page (up to 20 listings) | 50 credits, no card | Google Maps listings around each city: phone, website, category, rating and reviews, including businesses with no website. |
+| **Scavio Google Search** | ~$0.03 / depth-30 search | same 50 credits | Rank as the signal, on the same key as Scavio Google Maps. |
 
 **Selling to startups?** Harvey has a built-in startup skill, made of three
 parts:
@@ -311,6 +358,15 @@ Every address is tagged honestly: `verified` / `risky` (catch-all) / `guess` / `
 Harvey's sales knowledge lives in `skills/` as **plain Markdown you can edit**. There is no fine-tuning, no vector store, no retrieval step. Before an agent runs, the skills it needs are concatenated straight into its prompt. Change a file, and the next heartbeat behaves differently — no restart, no code change.
 
 This is the main way you shape Harvey. If its emails are too pushy, edit `email_frameworks.md`. If it mishandles a specific objection, edit `objection_handling.md` and add the response you'd actually give.
+
+**Your own email shape.** Whatever the skills say, the Writer ends every prompt with a built-in shape: email 1 under 75 words, one observation and one question, no pitch, no link. If your first email has to do more (say who you are, what it costs, link to a sign-up page), write your rules in a markdown file and point `writer.email_rules` at it:
+
+```yaml
+writer:
+  email_rules: "skills/email_rules.md"   # gitignored
+```
+
+The file replaces the built-in shape for the per-person first email and the 3-email sequence, and wins over `email_frameworks.md` and the prompt's style rules where they disagree. It can't lift the FACTS rule (nothing about a prospect is invented), and the send gate still applies: at most 220 words and one link per email, and the do-not-contact list. If `compliance.opt_out_line` is set, Harvey adds it under each cold email and tells the Writer not to write a second one; leave it empty and your rules can put an opt-out sentence in the body instead (Harvey still warns, since it can't check your sentence). Harvey's own opt-out phrase checks are in English; the model still reads every reply for a request to stop. A file that's set but missing, empty or over 20,000 characters stops the Writer until it's fixed, rather than drafting in the shape you replaced.
 
 ### What ships
 
@@ -546,6 +602,7 @@ channels:
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
 writer:       { humanizer }   # optional; true adds one editing pass per batch using ~/.claude/skills/humanizer/SKILL.md
+              # email_rules: your own markdown rules for the emails' shape (see The skills library)
 ```
 
 `max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).
@@ -617,15 +674,15 @@ What to know:
 
 Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
 
-**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Not interested? Reply "no thanks" and I won't email again.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Nothing Harvey does later moves someone off *opted out*: a later message from them is kept for you to read, never answered, and a complaint still goes to you. To see why someone was opted out (the rule that fired, the words, and their message), click **Why?** on their row in Contacts. If it was a mistake, **Undo opt-out** there marks them as replied: Harvey sends nothing on its own, and their next reply gets a draft for your approval. Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Reply "no thanks"`, `Reply STOP`, also "unsubscribe", "remove me", "opt out") and can't contain a link or email address.
+**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Not interested? Reply "no thanks" and I won't email again.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Nothing Harvey does later moves someone off *opted out*: a later message from them is kept for you to read, never answered, and a complaint still goes to you. To see why someone was opted out (the rule that fired, the words, and their message), click **Why?** on their row in Contacts. If it was a mistake, **Undo opt-out** there marks them as replied: Harvey sends nothing on its own, and their next reply gets a draft for your approval. Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Reply "no thanks"`, `Reply STOP`, also "unsubscribe", "remove me", "opt out") and can't contain a link or email address. Hebrew works the same way: a line such as `השיבו "הסר"` or `תגידו לי "לא תודה"` is accepted, and Harvey catches Hebrew opt-outs without the model: a bare "הסר", "תורידו אותי מהרשימה", "תפסיקו לשלוח", "אל תכתבו לי", "לא מעוניין, תודה".
 
 **Do not contact.** List competitors, existing customers, or anyone else Harvey must never email under `compliance.do_not_contact`, one address or domain per line, in the config file Harvey reads: `harvey.local.yaml` if you trained Harvey (that file wins), otherwise `harvey.yaml`. A domain covers its subdomains (`acme.example` also blocks `mail.acme.example`, not `notacme.example`), an address covers its plus-tags (`jane@` also blocks `jane+news@`), and a pasted link such as `https://www.acme.example/about` or `Jane Doe <jane@acme.example>` counts as what it names. An entry that is neither an address nor a domain stops Harvey from starting, with the entry named, rather than quietly protecting nobody. A running Harvey picks up an edit at once, and the send gate checks the list as each email leaves, cold or reply, so it holds even for an email you already approved. If someone on the list writes back, Harvey doesn't draft an answer: the conversation comes to you. `harvey export` and the dashboard's Export buttons leave them out too. On Instantly, listed leads are left out of the upload and a reply to one comes to you, but Harvey can't take back a lead Instantly already has: remove it there.
 
 **GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
 
-**Per-recipient check (optional).** Those rules turn on facts about each recipient: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) about each new recipient before the first cold email. Anything other than `ok_to_email` holds that email back, with the rule and the next step shown in the Outbox, and the signed receipt id is logged with every send. One check per address, cached for 30 days (changing the sender country, address source, product description or prospect country triggers a fresh check); replies are never checked; native providers (Gmail, Microsoft 365, SMTP) only. Precleared works out each recipient's country from the address, company records or the company's website; if all your prospects are in one country, also set `prospect_country` (for example `US`), which it uses only when none of those show it. Precleared receives the recipient's address, your sender country, the address source, your product description and, if set, your prospects' country. Without a key it allows 10 checks a day, and a free key (`PRECLEARED_API_KEY`) allows 25. Put the setting in `harvey.yaml`, or in `harvey.local.yaml` if you trained Harvey, since that file wins.
+**Per-recipient check (optional).** Those rules turn on facts about each recipient: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) about each new recipient before the first cold email. Anything other than `ok_to_email` holds that email back, with the rule and the next step shown in the Outbox, and the signed receipt id is logged with every send. One check per address, cached for 30 days (changing the sender country, address source, product description or the country sent with it triggers a fresh check); replies are never checked; native providers (Gmail, Microsoft 365, SMTP) only. Harvey tells Precleared the recipient's country when it is sure of it from the company's location (a country, a US state, a Canadian province or an Australian state named there, as for the send window), and Precleared takes that as settled; otherwise Precleared works the country out from the address, company records or the company's website. If all your prospects are in one country, also set `prospect_country` (for example `US`), which Precleared uses only when none of those show it; without it, the one country every `icp.geography` entry is in serves as that default. Precleared receives the recipient's address, your sender country, the address source, your product description and the recipient's country when Harvey is sure of it, else your prospects' country if there is one. It also receives the company's name and the person's name when Harvey has them, which it uses to find a UK company on the Companies House register when the domain alone doesn't (it doesn't store the person's name). Without a key it allows 10 checks a day, and a free key (`PRECLEARED_API_KEY`) allows 25. Put the setting in `harvey.yaml`, or in `harvey.local.yaml` if you trained Harvey, since that file wins. [docs/precleared.md](docs/precleared.md) has the details, verdict by verdict.
 
-**If the check is held up.** When Precleared can't answer (the day's free checks are used up, the key is out of checks or was rejected, or Precleared can't be reached), cold email waits and replies still go out. The Today page and `harvey status` say how many cold emails are waiting and what fixes it.
+**If the check is held up.** When Precleared can't answer (the day's free checks are used up, the key is out of checks, was rejected or is being rate limited, or Precleared can't be reached), cold email to new addresses waits and replies still go out; email to people Precleared has already cleared keeps going. If Precleared can't check one address, that email is tried again six hours later and the rest carry on, unless that happens at two different domains with no answer in between, which holds new addresses as above. The Today page and `harvey status` say how many cold emails are waiting on the check and what fixes it.
 
 **Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
 

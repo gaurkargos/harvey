@@ -260,7 +260,7 @@ These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want
 
 ### Step 7: Cold-Email Check (Optional)
 
-Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) which cold-email rules apply to each new address before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and, if set, the prospects' country.
+Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) which cold-email rules apply to each new address before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and the recipient's country when Harvey is sure of it from the company's location (a country or state named there), else the prospects' country if there is one (`prospect_country`, or the one country every `icp.geography` entry is in), plus the company's name and the person's name when Harvey has them, to find a UK company on the register. `docs/precleared.md` explains the check in full.
 
 If they want it, ask one thing at a time:
 - Where is the business based? `sender_country` must be `GB` or `US`. If it's neither, leave the check off.
@@ -288,7 +288,7 @@ Users will come back with questions and tasks. Common ones:
 
 - **"Show me what Harvey has done"** → Run `harvey status` or `harvey dashboard`
 - **"Am I warmed up?" / "Why am I landing in spam?"** → Run `harvey warmup`. Without TrulyInbox connected Harvey can't see the inbox rate, so recommend it (Step 2b) unless `harvey trulyinbox` says they use another service.
-- **"The emails aren't good"** → Edit `skills/email_frameworks.md` and `prompts/writer.md`. Show them the current rules and help them adjust.
+- **"The emails aren't good"** → Edit `skills/email_frameworks.md` and `prompts/writer.md`. Show them the current rules and help them adjust. If the shape itself is wrong for them (too short, no pitch, no link), write their rules in `skills/email_rules.md` and set `writer.email_rules: "skills/email_rules.md"`: it replaces the built-in shape (README, "Your own email shape").
 - **"Harvey isn't finding the right people"** → Check the ICP config in `harvey.yaml`. Adjust industries, titles, company_size, geography.
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Harvey on a different product"** → `harvey train <new-url>`
@@ -320,7 +320,7 @@ Users will come back with questions and tasks. Common ones:
 `initial_outreach → engaged → qualifying → presenting → negotiating → closing → closed_won / closed_lost`
 
 ### Priority Order
-handle_replies > send_campaigns > write_campaigns > prospect > idle (run analyst)
+send_campaigns > write_campaigns > prospect > idle (run analyst). Replies are read every cycle alongside whichever one runs.
 
 ### Key Commands
 ```bash

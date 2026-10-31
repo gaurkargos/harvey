@@ -24,6 +24,7 @@ import asyncio
 import time
 import base64
 import logging
+import math
 import re
 from html import unescape
 from dataclasses import dataclass, field, replace
@@ -53,9 +54,17 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(yelp|yellowpages|superpages|manta|bbb|angi|angieslist|homeadvisor)\.",
     r"(^|\.)(thumbtack|houzz|porch|buildzoom|networx|modernize|nextdoor)\.",
     r"(^|\.)(facebook|instagram|twitter|x|linkedin|youtube|tiktok|pinterest)\.",
+    r"(^|\.)(meetup|eventbrite)\.",
     r"(^|\.)(indeed|glassdoor|ziprecruiter|craigslist|zillow|realtor)\.",
     r"(^|\.)(mapquest|foursquare|tripadvisor|trustpilot|birdeye|expertise)\.",
     r"(directory|listings?|find-?a-|top\d+|best-?of)\.",
+    # Job boards, directories, and marketplaces.
+    r"(^|\.)(naukri|jobrapido|jobsora|empleos|shine|foundit|timesjobs|freelancer|upwork)\.",
+    # Indian directories & marketplaces
+    r"(^|\.)(indiamart|justdial|tradeindia|exportersindia|sulekha|urbanpro|yet5)\.",
+    r"(^|\.)(olx|quikr|flipkart|snapdeal|myntra|shopclues|etsy|ebay|alibaba|aliexpress)\.",
+    # hobby communities & model repositories — never a prospect
+    r"(^|\.)(boardgamegeek|team-bhp|hackaday|instructables|thingiverse|printables|cults3d|thangs|grabcad)\.",
     # media & reference
     r"(^|\.)(wikipedia|reddit|quora|medium|substack|forbes|inc|entrepreneur)\.",
     r"(news|magazine|journal|gazette|tribune|herald)\.(com|org|net)$",
@@ -437,6 +446,14 @@ def _dfs_location(query: "DiscoveryQuery", point_suffix: str) -> dict:
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
+# Match whole placeholder values, never substrings of opaque credentials.
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)(placeholder|change[-_]?me|your[_-](?:api[_-])?key(?:[_-]here)?"
+    r"|paste[_-](?:api[_-])?key(?:[_-]here)?|x{4,}|<[a-z_ -]+>"
+    r"|todo|fixme|example[_-](?:api[_-])?key)"
+)
+
+
 class ProviderExhausted(RuntimeError):
     """This provider can take no more searches in this run: its allowance or
     rate limit is used up, or it refused the key. The run stops and says why,
@@ -467,8 +484,24 @@ class DiscoveryProvider:
     # longer finds a business it found before records that, per phrase.
     rank_codes: tuple[str, ...] = ()
 
+    def missing_keys(self, env: dict) -> list[str]:
+        """Env keys that are absent, empty, or still the template placeholder.
+
+        An empty ``SERPER_API_KEY=`` line used to pass the truthiness check,
+        the run then "succeeded" with zero queries, and the process exited 0
+        — a silent no-op that reads as success. Name the bad keys here,
+        before any money or time is spent.
+        """
+        def _missing(value) -> bool:
+            if not isinstance(value, str):
+                return not value
+            value = value.strip()
+            return (not value) or bool(_PLACEHOLDER_RE.fullmatch(value))
+
+        return [k for k in self.env_keys if _missing(env.get(k))]
+
     def configured(self, env: dict) -> bool:
-        return all(env.get(k) for k in self.env_keys)
+        return not self.missing_keys(env)
 
     def estimate(self, queries: list[DiscoveryQuery]) -> float:
         """Projected spend, in dollars, before anything is called."""
@@ -481,6 +514,10 @@ class DiscoveryProvider:
     # Shared helper: providers report their own per-query spend so the run log
     # records what actually happened, not what was projected.
     last_cost: float = 0.0
+    last_error: str = ""
+    stop_reason: str = ""
+    complete: bool = True
+    remaining_budget: float = math.inf
 
 
 class DataForSEOListings(DiscoveryProvider):
@@ -779,18 +816,20 @@ class Serper(DiscoveryProvider):
     free_tier = "2,500 queries free, no card required"
     signup_url = "https://serper.dev"
     env_keys = ("serper_api_key",)
-    caveat = "Paid plans start at a $50 prepaid pack; credits expire after 6 months."
+    caveat = "Returns at most 10 results per query, including when a greater depth is requested."
 
     def estimate(self, queries):
-        # One credit per 10 results on the standard plan.
-        return sum(0.001 * max(1, -(-q.depth // 10)) for q in queries)
+        # One request per query, capped at ten results for free-account compatibility.
+        return 0.001 * len(queries)
 
     async def fetch(self, client, env, query):
         r = await client.post(
             "https://google.serper.dev/search",
             headers={"X-API-KEY": env["serper_api_key"],
                      "Content-Type": "application/json"},
-            json={"q": query.keyword(), "num": min(query.depth, 100)},
+            # Free accounts reject num > 10 (HTTP 400 "Query pattern not
+            # allowed for free accounts"), verified 2026-10-26.
+            json={"q": query.keyword(), "num": max(1, min(query.depth, 10))},
         )
         r.raise_for_status()
         data = r.json()
@@ -1005,14 +1044,44 @@ class OpenStreetMap(DiscoveryProvider):
     # Several public Overpass instances run the same API. The main one
     # throttles readily, so try the mirrors before giving up — a free source
     # that fails half the time is not usable as a default.
+    # Two entries, two conditions, both measured — see
+    # scripts/diagnose_overpass.py, which re-checks them.
+    #
+    # Each must be its OWN instance: overpass.private.coffee sat here and
+    # resolved to the same address as overpass.kumi.systems, so a 502 on the
+    # first mirror bought two attempts at one machine and none at a second.
+    #
+    # Each must also hold the WHOLE planet. The community instances answer in
+    # a fraction of a second and are independent, which makes them tempting:
+    # overpass.osm.ch tallied ZERO cafes within a kilometre of downtown Denver
+    # in 0.21s, so it serves a regional extract, and overpass.osm.jp is the
+    # same kind of instance. A mirror like that answers "roofers in Denver"
+    # with an empty list, and an empty list here is indistinguishable from a
+    # market with nobody in it — the one failure this provider must never
+    # produce. Vet a candidate with
+    # `python scripts/diagnose_overpass.py --coverage <url>` before adding it;
+    # independence at the DNS level is not enough.
     ENDPOINTS = (
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.private.coffee/api/interpreter",
     )
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
     MIN_INTERVAL = 2.0
     BACKOFF = 5.0
+    # A free instance queues before it computes: node(1) — the smallest query
+    # Overpass accepts — measured 38s of pure waiting on a busy afternoon. The
+    # module-wide 45s read budget leaves nothing for a real query over a 40km
+    # radius, so Overpass gets its own and asks the server for a matching
+    # slice of execution time. Slow beats empty-handed, and a run that cannot
+    # afford the wait stops on MAX_PROSPECTS_PER_CYCLE, not on a timeout.
+    HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0,
+                                 pool=10.0)
+    SERVER_TIMEOUT = 90
+    # Statuses that say "this mirror, right now" rather than "this query":
+    # throttling, a gateway that lost its backend, an overloaded instance, a
+    # timed-out one. Every one of them is another mirror's problem to solve, so
+    # walk on. A 400 (bad query) or 404 is ours and fails here and now.
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
     TAG_MAP = {
@@ -1061,11 +1130,13 @@ class OpenStreetMap(DiscoveryProvider):
             f'way[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
             for tag in tags
         )
-        body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
+        body = (f"[out:json][timeout:{self.SERVER_TIMEOUT}];({clauses});"
+                f"out center {query.limit};")
 
-        # Overpass is a free volunteer service and 429s/504s readily under
-        # load. Walk the mirrors, then RAISE: returning [] would make a
-        # throttled run look exactly like a market with no businesses in it.
+        # Overpass is a free volunteer service and throttles, 502s and times
+        # out readily under load. Walk the mirrors, then RAISE: returning []
+        # would make a throttled run look exactly like a market with no
+        # businesses in it.
         headers = {"User-Agent": "Harvey/0.1 (open-source sales agent; "
                                  "github.com/ethanplusai/harvey)"}
         r = None
@@ -1074,19 +1145,20 @@ class OpenStreetMap(DiscoveryProvider):
                 await asyncio.sleep(self.BACKOFF)
             try:
                 r = await client.post(endpoint, content=body.encode(),
-                                      headers=headers)
+                                      headers=headers,
+                                      timeout=self.HTTP_TIMEOUT)
             except httpx.HTTPError as e:
                 logger.warning("osm: %s unreachable (%s)", endpoint, e)
                 continue
-            if r.status_code not in (429, 504):
+            if r.status_code not in self.RETRY_STATUSES:
                 break
-            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
-                           endpoint, r.status_code)
+            logger.warning("osm: %s is throttling or down (%s) — trying the "
+                           "next mirror", endpoint, r.status_code)
         else:
             raise RuntimeError(
-                "Every public Overpass mirror is throttling right now. This is "
-                "free volunteer infrastructure — wait a few minutes and re-run, "
-                "or use a paid provider for bulk work.")
+                "Every public Overpass mirror is unavailable or throttling "
+                "right now. This is free volunteer infrastructure — wait a few "
+                "minutes and re-run, or use a paid provider for bulk work.")
         if r is None:
             raise RuntimeError("Could not reach any Overpass mirror.")
         r.raise_for_status()
@@ -1117,6 +1189,255 @@ class OpenStreetMap(DiscoveryProvider):
         return out
 
 
+class ScavioProvider(DiscoveryProvider):
+    """Shared plumbing for the two Scavio adapters: one key, one credit price.
+
+    Scavio bills 1 credit per page. A page that fails after earlier pages
+    succeeded ends the query with what it already has, the same rule the run
+    loop applies between queries. A failure on the first page raises:
+    returning [] would make an expired key look like an empty market.
+    """
+
+    signup_url = "https://scavio.dev"
+    env_keys = ("scavio_api_key",)
+    free_tier = "50 credits on signup, no card"
+
+    API = "https://api.scavio.dev/api/v2/google"
+    # Conservative pay-as-you-go price; subscription credits can cost less.
+    CREDIT_PRICE = 0.01
+    MIN_INTERVAL = 1.05  # free accounts allow one request per second
+
+    def __init__(self):
+        self._last_call = 0.0
+
+    async def _post(self, client, env, path: str, body: dict) -> dict:
+        if self.last_cost + self.CREDIT_PRICE > self.remaining_budget + 1e-12:
+            raise ProviderExhausted("Scavio: budget reached before the next page")
+        wait = self._last_call + self.MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_call = time.monotonic()
+        try:
+            r = await client.post(
+                f"{self.API}{path}",
+                headers={"Authorization": f"Bearer {env['scavio_api_key']}",
+                         "Content-Type": "application/json"},
+                json=body,
+            )
+        except httpx.HTTPError:
+            raise RuntimeError("Scavio: request failed; try again later") from None
+        # Never put response bodies in logs: upstream errors may echo secrets.
+        if r.status_code in (401, 402, 403, 429):
+            reasons = {401: "invalid API key", 402: "insufficient credits",
+                       403: "access refused", 429: "rate limit reached"}
+            raise ProviderExhausted(f"Scavio {r.status_code}: {reasons[r.status_code]}")
+        if r.status_code >= 400:
+            raise RuntimeError(f"Scavio {r.status_code}: request failed")
+        # A successful response is billable even if its body is malformed.
+        self.last_cost += self.CREDIT_PRICE
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError("Scavio: invalid JSON response") from None
+        if not isinstance(data, dict) or data.get("error"):
+            raise RuntimeError("Scavio: invalid response")
+        credits = data.get("credits_used", 1)
+        if (isinstance(credits, (int, float)) and not isinstance(credits, bool)
+                and math.isfinite(credits) and credits >= 0):
+            self.last_cost += (credits - 1) * self.CREDIT_PRICE
+        return data
+
+    async def _pages(self, client, env, query, path: str, body: dict,
+                     results_key: str, page_size: int, pages: int
+                     ) -> list[tuple[int, dict]]:
+        """Every result as (offset of its page, item), page by page."""
+        self.last_cost = 0.0
+        self.last_error = self.stop_reason = ""
+        self.complete = True
+        rows: list[tuple[int, dict]] = []
+        for page in range(pages):
+            start = page * page_size
+            try:
+                data = await self._post(client, env, path, dict(body, start=start))
+                items = data.get(results_key)
+                if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                    raise RuntimeError("Scavio: invalid results list")
+                for item in items:
+                    for field in ("title", "website", "link", "phone", "address", "type", "place_id"):
+                        if item.get(field) is not None and not isinstance(item[field], str):
+                            raise RuntimeError("Scavio: invalid result field")
+                    for field in ("rating", "reviews", "position"):
+                        value = item.get(field)
+                        if value is not None and (isinstance(value, bool)
+                                or not isinstance(value, (int, float))
+                                or not math.isfinite(value) or value < 0):
+                            raise RuntimeError("Scavio: invalid numeric result field")
+                last_page = self._last_page(data, items, page_size)
+            except Exception as e:
+                self.complete = False
+                self.last_error = str(e)
+                if isinstance(e, ProviderExhausted):
+                    self.stop_reason = str(e)
+                if not rows:
+                    raise
+                logger.warning("%s: page %d of %r failed, keeping %d results: %s",
+                               self.key, page + 1, query.keyword(), len(rows), e)
+                break
+            rows.extend((start, item) for item in items)
+            if last_page:
+                break
+        return rows
+
+    def _last_page(self, data: dict, items: list, page_size: int) -> bool:
+        return len(items) < page_size
+
+
+class ScavioMaps(ScavioProvider):
+    """Google Maps listings, the source issue #28 asked for.
+
+    Every place Google Maps shows for a search around a point, with phone,
+    website, category, rating and review count. Businesses with no website
+    are kept, like the other listings providers.
+    """
+
+    key = "scavio_maps"
+    needs_coordinates = True
+    label = "Scavio Google Maps"
+    kind = "listings"
+    blurb = ("Google Maps results around each city: phone, website, category, "
+             "rating and review count for every place. Up to 120 businesses "
+             "per search.")
+    cost_note = "1 credit per page (up to 20 listings); estimates use $0.01/credit"
+    caveat = ("Google Maps does not say whether a listing is claimed, so the "
+              "unclaimed-listing signal stays empty. Same key as Scavio Google "
+              "Search.")
+
+    PAGE_SIZE = 20
+    MAX_PAGES = 6        # the API accepts start up to 100
+
+    def _page_count(self, query: DiscoveryQuery) -> int:
+        return max(1, min(self.MAX_PAGES, -(-query.limit // self.PAGE_SIZE)))
+
+    def estimate(self, queries):
+        return sum(self.CREDIT_PRICE * self._page_count(q) for q in queries)
+
+    @staticmethod
+    def map_center(coordinate: str) -> str:
+        """"39.7392,-104.9903,40" -> "@39.7392,-104.9903,10z".
+
+        Google Maps takes a center and a zoom, not a radius. A zoom-z view
+        spans roughly 40,000 km / 2^z, so a 40 km radius is zoom 10 (one
+        metro area) and 5 km is zoom 13.
+        """
+        parts = [p.strip() for p in coordinate.split(",")]
+        if len(parts) < 2 or not all(parts[:2]):
+            return ""
+        try:
+            lat, lng = float(parts[0]), float(parts[1])
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                return ""
+        except ValueError:
+            return ""
+        try:
+            radius_km = float(parts[2]) if len(parts) > 2 and parts[2] else 40.0
+        except ValueError:
+            radius_km = 40.0
+        if not math.isfinite(radius_km) or radius_km <= 0:
+            radius_km = 40.0
+        zoom = round(math.log2(40000 / max(radius_km, 0.5)))
+        return f"@{parts[0]},{parts[1]},{max(3, min(zoom, 16))}z"
+
+    async def fetch(self, client, env, query):
+        # The map center picks the area, as it does in the Maps app. Without
+        # one the API falls back to a default city for the country, so the
+        # place name has to ride in the query instead.
+        center = self.map_center(query.coordinate) if query.coordinate else ""
+        body = {"query": query.term, "ll": center} if center else {"query": query.keyword()}
+
+        out = []
+        for _, item in await self._pages(
+                client, env, query, "/maps/search", body, "local_results",
+                self.PAGE_SIZE, self._page_count(query)):
+            name = item.get("title") or ""
+            if not name:
+                continue
+            site = item.get("website") or ""
+            place_id = item.get("place_id") or ""
+            out.append(Business(
+                name=name,
+                domain=normalize_domain(site),
+                website=site,
+                phone=item.get("phone") or "",
+                address=item.get("address") or "",
+                location=query.location,
+                category=item.get("type") or "",
+                rating=item.get("rating"),
+                review_count=item.get("reviews"),
+                has_website=bool(site),
+                # A Maps list position is not an organic rank, so rank stays
+                # None and no SERP_RANK is recorded for it.
+                external_id=f"gmaps:{place_id}" if place_id else "",
+                source_url=(f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+                            if place_id else site),
+                provider=self.key,
+            ))
+        return out
+
+
+class ScavioSearch(ScavioProvider):
+    """Google organic results with rank, from the same key as Scavio Maps."""
+
+    key = "scavio_search"
+    rank_codes = ("SERP_RANK",)
+    label = "Scavio Google Search"
+    kind = "serp"
+    blurb = ("Google organic results with rank positions. One Scavio key "
+             "covers this and Google Maps listings.")
+    cost_note = "1 credit per page (up to 10 results); depth 30 estimated at $0.03"
+    caveat = ("Results come from google.com in English (US) unless the search "
+              "names another place. Depth 20-30 is the sweet spot.")
+
+    PAGE_SIZE = 10
+
+    def estimate(self, queries):
+        return sum(self.CREDIT_PRICE * max(1, -(-q.depth // self.PAGE_SIZE))
+                   for q in queries)
+
+    def _last_page(self, data, items, page_size):
+        # Google often shows fewer than 10 organic results on a page (a local
+        # pack or videos take the space), so a short page is not the end.
+        # The end is when Google offers no next page.
+        pagination = data.get("pagination") or {}
+        if not isinstance(pagination, dict):
+            raise RuntimeError("Scavio: invalid pagination")
+        return not items or not pagination.get("next")
+
+    async def fetch(self, client, env, query):
+        out = []
+        for start, item in await self._pages(
+                client, env, query, "", {"query": query.keyword()},
+                "organic_results", self.PAGE_SIZE,
+                max(1, -(-query.depth // self.PAGE_SIZE))):
+            domain = normalize_domain(item.get("link") or "")
+            if not domain:
+                continue
+            position = item.get("position")
+            out.append(Business(
+                name=business_name(item.get("title") or "", domain),
+                raw_title=item.get("title") or "",
+                domain=domain,
+                website=item.get("link") or "",
+                location=query.location,
+                # `position` restarts at 1 on every page, so page 2's first
+                # result is rank 11, not rank 1.
+                rank=start + position if isinstance(position, int) and position > 0 else None,
+                has_website=True,
+                source_url=item.get("link") or "",
+                provider=self.key,
+            ))
+        return out
+
+
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
@@ -1125,6 +1446,8 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
         DataForSEOSerp(),
         DataForSEOMaps(),
         Serper(),
+        ScavioMaps(),
+        ScavioSearch(),
     )
 }
 
@@ -1170,10 +1493,17 @@ class DiscoveryReport:
 
     provider: str = ""
     queries: int = 0
+    queries_ran: int = 0     # attempted provider requests
+    queries_succeeded: int = 0
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     found: int = 0
     junk: int = 0
+    # Counted apart from `junk` on purpose: junk is a judgement about whether
+    # a result is a business at all, this is a company the operator has
+    # forbidden. Folding them together would hide a do-not-contact list that
+    # has grown too broad inside a number nobody questions.
+    excluded: int = 0
     new_companies: int = 0
     known_companies: int = 0
     observations: int = 0
@@ -1184,9 +1514,12 @@ class DiscoveryReport:
     def as_dict(self) -> dict:
         return {
             "provider": self.provider, "queries": self.queries,
+            "queries_ran": self.queries_ran,
+            "queries_succeeded": self.queries_succeeded,
             "estimated_cost": round(self.estimated_cost, 4),
             "actual_cost": round(self.actual_cost, 4),
             "found": self.found, "junk": self.junk,
+            "excluded": self.excluded,
             "new_companies": self.new_companies,
             "known_companies": self.known_companies,
             "observations": self.observations,
@@ -1356,7 +1689,8 @@ async def run_discovery(
     every time: the first small trial is what exposes the data-quality
     problems that would otherwise poison every market you scale to.
     """
-    from harvey.config import load_env
+    from harvey.config import live_do_not_contact, load_env
+    from harvey.gate import do_not_contact_domain_match
     from harvey.signals import seed_signal_catalog
 
     provider = PROVIDERS.get(provider_key)
@@ -1373,10 +1707,12 @@ async def run_discovery(
         return report
 
     env = load_env().model_dump()
-    if not provider.configured(env):
-        missing = ", ".join(k.upper() for k in provider.env_keys
-                            if not env.get(k))
-        report.errors.append(f"{provider.label} needs {missing} in .env")
+    missing = provider.missing_keys(env)
+    if missing:
+        names = ", ".join(k.upper() for k in missing)
+        report.errors.append(
+            f"{provider.label} is not ready: {names} is empty or still the "
+            f"template placeholder in .env")
         report.stopped = "not configured"
         return report
 
@@ -1401,6 +1737,11 @@ async def run_discovery(
         params={"queries": len(queries), "estimate": report.estimated_cost},
     )
 
+    # Resolved once per run, not per result: the list may live in a file, and
+    # re-reading it a few hundred times would turn a config lookup into I/O
+    # inside the hot loop.
+    do_not_contact = live_do_not_contact(config)
+
     # Each business's base facts are written once per run; its ranks once per
     # (business, keyword), and again only if a repeat search ranks it better.
     seen: set[str] = set()
@@ -1422,9 +1763,13 @@ async def run_discovery(
                     await asyncio.sleep(OpenStreetMap.MIN_INTERVAL)
 
                 try:
+                    report.queries_ran += 1
                     provider.last_cost = 0.0
+                    provider.last_error = provider.stop_reason = ""
+                    provider.complete = True
+                    provider.remaining_budget = max(0.0, max_spend - report.actual_cost)
                     found = await provider.fetch(client, env, query)
-                    report.actual_cost += provider.last_cost
+                    report.queries_succeeded += 1
                 except ProviderExhausted as e:
                     logger.warning("discover: %s stopped: %s", provider_key, e)
                     report.stopped = str(e)
@@ -1436,7 +1781,11 @@ async def run_discovery(
                                    provider_key, query.keyword(), e)
                     report.errors.append(f"{query.keyword()}: {e}")
                     continue
+                finally:
+                    report.actual_cost += provider.last_cost
 
+                if provider.last_error:
+                    report.errors.append(f"{query.keyword()}: {provider.last_error}")
                 report.found += len(found)
                 batch = []
                 for biz in found:
@@ -1446,6 +1795,14 @@ async def run_discovery(
                         biz.domain = company_host(biz.domain)
                     if is_junk(biz.domain, biz.raw_title or biz.name):
                         report.junk += 1
+                        continue
+                    # Before the upsert, so a forbidden company never becomes a
+                    # row and never reaches profiling. Checking it at send time
+                    # alone still lets one through discovery, where it costs
+                    # credits to enrich and sits in every cohort until somebody
+                    # notices it by eye.
+                    if do_not_contact_domain_match(biz.domain, do_not_contact):
+                        report.excluded += 1
                         continue
                     ident = biz.identity()
                     if not ident:
@@ -1492,7 +1849,7 @@ async def run_discovery(
                 # it this run has found, is no longer ranked (within depth) or
                 # no longer in the pack. Say so, so the latest reading is true.
                 phrase = query.keyword()
-                for code in provider.rank_codes:
+                for code in provider.rank_codes if provider.complete else ():
                     if code not in confirmed:
                         continue
                     found_now = ranked_in_run.setdefault((code, phrase), set())
@@ -1509,6 +1866,9 @@ async def run_discovery(
                 if batch:
                     report.observations += await state.add_observations(
                         batch, run_id=report.run_id)
+                if provider.stop_reason:
+                    report.stopped = provider.stop_reason
+                    break
 
         await state.finish_run(report.run_id, status="completed",
                                records=report.new_companies + report.known_companies,
@@ -1610,8 +1970,14 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
 
 
 def provider_menu(env: dict | None = None) -> list[dict]:
-    """The menu the dashboard renders: what each provider does, and its cost."""
-    env = env or {}
+    """The menu the dashboard renders: what each provider does, and its cost.
+
+    The CLI calls this bare; without a load, every keyed provider would show
+    "needs setup" even with a working key in .env.
+    """
+    if env is None:
+        from harvey.config import load_env
+        env = load_env().model_dump()
     return [
         {
             "key": p.key, "label": p.label, "kind": p.kind, "blurb": p.blurb,
