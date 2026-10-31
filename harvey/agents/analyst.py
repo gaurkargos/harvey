@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from harvey.config import HarveyConfig
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.analyst")
@@ -16,8 +17,9 @@ class Analyst:
     Runs during idle cycles and writes a report to data/analytics.json.
     """
 
-    def __init__(self, state: StateManager):
+    def __init__(self, state: StateManager, config: HarveyConfig):
         self.state = state
+        self.config = config
 
     async def run(self):
         """Generate analytics report from current pipeline data."""
@@ -171,10 +173,23 @@ class Analyst:
                 "CLOSING guidance to propose specific meeting times earlier (by message 2)."
             )
         if total_queued > 0 and total_contacted == 0:
-            insights.append(
-                f"BLOCKED: {total_queued} prospects are queued but nothing has been sent. "
-                "Check the Instantly API key and Sender logs — campaigns may be failing to deploy."
-            )
+            # A disabled email channel is a configured hold, not a failure:
+            # queued prospects are exactly what "sending off" looks like, so
+            # don't send anyone chasing an API key that was never the problem.
+            email = getattr(getattr(self.config, "channels", None), "email", None)
+            if email is not None and not getattr(email, "enabled", False):
+                insights.append(
+                    f"HOLD: {total_queued} prospects are queued and nothing has been "
+                    "sent because the email channel is disabled "
+                    "(channels.email.enabled: false) — that's the configured state, "
+                    "not a failure. Set it to true in harvey.yaml (or "
+                    "harvey.local.yaml) when you're ready to send."
+                )
+            else:
+                insights.append(
+                    f"BLOCKED: {total_queued} prospects are queued but nothing has been sent. "
+                    "Check the Instantly API key and Sender logs — campaigns may be failing to deploy."
+                )
         if total_new < 10 and total_queued == 0:
             insights.append(
                 f"ACTION: Prospect pool is nearly empty ({total_new} new). Scout should run "

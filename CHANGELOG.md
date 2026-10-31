@@ -304,6 +304,13 @@ minor versions can still change behaviour.
   goes to **Needs you**. A conversation handed to you stays with you: later
   replies join it and Harvey doesn't answer them until you hand it back. Before,
   a reply after an escalation started a new conversation Harvey could answer.
+- **A disabled email channel is a hold, not a blockage.** The analyst insight
+  for queued prospects with nothing sent always said "BLOCKED: check the
+  Instantly API key" — wrong advice when sending is switched off on purpose
+  (`channels.email.enabled: false`), which is precisely a state where nothing
+  can have been sent. The analyst now knows the config and says the queue is
+  held by the disabled channel, naming the setting to flip when you're ready;
+  the API-key warning only appears while the channel is on.
 - **Replies remember the whole conversation** (closes #97). A reply was
   written from the last six messages only, so a requirement the prospect
   stated earlier ("synthetic data only, processed in the EU") dropped out
