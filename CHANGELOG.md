@@ -275,6 +275,11 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **OpenStreetMap discovery survives a bad afternoon** (from #125). A 500, 502 or
+  503 from one Overpass mirror now moves on to the next instead of ending the
+  search, Overpass gets enough time to get through its queue, and the mirror
+  list drops one that was the same machine as another. `scripts/diagnose_overpass.py`
+  re-checks the mirrors.
 - **Hebrew opt-outs are honored without the model** (from #134). A reply like
   "הסר", "תורידו אותי מהרשימה" or "לא תודה" now opts out as its English
   equivalent does, and `compliance.opt_out_line` can ask for a Hebrew reply.
