@@ -263,6 +263,9 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Hebrew opt-outs are honored without the model** (from #134). A reply like
+  "הסר", "תורידו אותי מהרשימה" or "לא תודה" now opts out as its English
+  equivalent does, and `compliance.opt_out_line` can ask for a Hebrew reply.
 - **Harvey keeps prospecting when it can't send or is waiting on a reply**
   (from #128, #126). A draft that couldn't deploy (email channel off, or native
   sending paused) or any open conversation used to win every cycle, so Harvey
