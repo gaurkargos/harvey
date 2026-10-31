@@ -177,3 +177,14 @@ def test_a_conversation_outside_the_latest_100_still_counts(client):
         _sql(db, "INSERT INTO conversations (id, prospect_id, campaign_id, channel, status, updated_at) "
                  "VALUES (?, ?, 'k1', 'email', 'closed', '2026-10-20')", (f"c{i}", f"q{i}"))
     assert _awaiting(client) == []
+
+
+def test_a_colleague_of_someone_who_replied_is_not_awaiting(client):
+    db = client.db_path
+    _emailed(db, "jane")
+    _emailed(db, "sam")
+    _emailed(db, "other")
+    _sql(db, "UPDATE prospects SET company_id = 'acme' WHERE id IN ('jane', 'sam')")
+    _sql(db, "INSERT INTO conversations (id, prospect_id, campaign_id, channel, status, updated_at) "
+             "VALUES ('j', 'jane', 'k1', 'email', 'open', '2026-10-20')")
+    assert _awaiting(client) == ["other"]

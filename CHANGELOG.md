@@ -16,7 +16,8 @@ minor versions can still change behaviour.
   10 results; estimates use the $0.01 pay-as-you-go credit price. Off unless
   you pick one in `harvey discover` or the dashboard. Closes #28.
 - **Sent emails on the Conversations tab.** A new *Awaiting reply* filter
-  lists everyone Harvey has emailed who hasn't answered yet, with each sent
+  lists people Harvey recently emailed who haven't answered yet (from its
+  latest 2,000 sent emails), with each sent
   email and when it went out, so the tab shows every outbound thread instead
   of only the ones that got a reply. When a reply arrives the card is
   replaced by the real conversation, which already shows those emails. The
@@ -25,7 +26,7 @@ minor versions can still change behaviour.
   the parameter returns exactly what it did before. *Open* still means reply
   conversations only. A card for a general inbox (no person's name) shows
   the company name instead of "Unknown". People who replied, opted out or
-  bounced aren't listed.
+  bounced, and colleagues of anyone who replied, aren't listed.
 - **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
   keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
   (or the new warmup step on the dashboard's setup checklist) checks a key and

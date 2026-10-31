@@ -1553,8 +1553,9 @@ async def _awaiting_reply() -> list[dict]:
     that got an answer. Read-only: no conversation row is created, and the
     card moves to the real conversation the moment a reply arrives."""
     waiting: dict[str, dict] = {}
-    # Only people still waiting: anyone with a conversation (even one past the
-    # tab's latest 100), a bounced address, or who's otherwise done isn't.
+    # Only people still waiting: anyone whose company has a conversation (even
+    # one past the tab's latest 100), a bounced address, or who's otherwise done
+    # isn't. Bounded because this runs on every load of the tab.
     sent = await query_db(
         "SELECT o.prospect_id, o.step, o.subject, o.body, o.sent_at, "
         "p.first_name, p.last_name, p.email AS prospect_email, p.company, "
@@ -1563,7 +1564,8 @@ async def _awaiting_reply() -> list[dict]:
         "WHERE o.kind = 'sequence' AND o.status = 'sent' "
         "AND p.status NOT IN ('replied', 'opted_out', 'lost', 'meeting', 'closed') "
         "AND COALESCE(p.email_status, '') != 'invalid' "
-        "AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.prospect_id = p.id) "
+        "AND NOT EXISTS (SELECT 1 FROM conversations c JOIN prospects q ON q.id = c.prospect_id "
+        "WHERE q.id = p.id OR (q.company_id = p.company_id AND COALESCE(p.company_id, '') != '')) "
         "ORDER BY o.sent_at DESC LIMIT 2000")
     for e in reversed(sent):
         pid = e["prospect_id"]
