@@ -677,3 +677,29 @@ def test_hebrew_no_that_isnt_no_thanks_keeps_the_lead(reply):
 @pytest.mark.parametrize("reply", ["לא תודה", "לא, תודה", "בינתיים לא, תודה", "‏לא תודה‏"])
 def test_hebrew_no_thanks_still_opts_out(reply):
     assert _opt_out_reason(reply, reply)["rule"] == "no_thanks"
+
+
+@pytest.mark.parametrize("reply", [
+    "אל תפנו אליי לפני ספטמבר, אז נדבר",   # not before September
+    "בבקשה לא לפנות אליי בשבת",            # not on Shabbat
+    "אל תיצרו קשר לפני יום ראשון",         # not before Sunday
+    "אל תשלח לי מייל, תתקשר אליי",         # don't email, call me
+    "אני לא מעוניין לקבל הודעות בוואטסאפ, מייל עדיף",  # no WhatsApp, email's better
+    "אפשר להוריד אותנו לחבילה הבסיסית?",   # move us down to the basic package
+    "אפשר להוריד מהרשימה את סעיף 4?",      # take item 4 off the list
+    "נא להפסיק את המנוי הישן ולעבור לתוכנית החדשה",  # cancel the old plan, move to the new
+    "אם תפסיקו לשלוח חשבוניות ידניות זה יעזור",  # if you stop sending manual invoices
+    "אל תסירו אותי מהרשימה",               # don't remove me
+    "אל תפסיקו לשלוח לי עדכונים",          # don't stop sending updates
+    "מדוע לא, תודה",                       # why not, thanks
+])
+def test_hebrew_that_only_looks_like_an_opt_out_is_left_to_the_model(reply):
+    assert _opt_out_reason(reply, reply) is None
+
+
+@pytest.mark.parametrize("reply", [
+    "אפשר להוריד אותי מהרשימה?", "תפסיקו לשלוח לי", "נא להפסיק", "נא להפסיק לשלוח",
+    "אל תפנו אליי יותר", "הסירו אותי מהרשימה בבקשה. תודה", "נסו לפני כן משהו אחר. תורידו אותי",
+])
+def test_hebrew_opt_outs_still_caught_after_tightening(reply):
+    assert _opt_out_reason(reply, reply) is not None

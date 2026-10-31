@@ -102,15 +102,17 @@ _HE_CONTACT = r"ל(?:שלוח|פנות|כתוב|הטריד|התקשר|הציק)"
 _HE_NOT_INTERESTED = r"(?:לא|אינני|איני|איננו)\s+מעוני{1,2}(?:ן|נת|נים|נות)"
 HEBREW_OPT_OUT_PATTERNS = (
     # Remove / take down / delete me (from the list).
-    _HE_REMOVE + r"\s+(?:(?:נא|בבקשה)\s+)?" + _HE_ME,
+    # Not "להוריד אותנו לחבילה הבסיסית" (down to the basic package).
+    _HE_REMOVE + r"\s+(?:(?:נא|בבקשה)\s+)?" + _HE_ME + r"(?!\s+ל\w)",
     _HE_REMOVE + r"\s+את\s+ה?(?:מייל|אימייל|כתובת|פרטים|מספר)\w*\s+(?:שלי|שלנו)",
-    r"(?:" + _HE_REMOVE + "|" + _HE_TAKE_OUT + r")\s+(?:" + _HE_ME + r"\s+)?" + _HE_LIST,
+    r"(?:" + _HE_REMOVE + "|" + _HE_TAKE_OUT + r")\s+(?:" + _HE_ME + r"\s+)?" + _HE_LIST
+    + r"(?!\s+את(?!\w))",
     r"(?:אבקש|מבקש|מבקשת|מבקשים|מבקשות|בקשת|בקשה)\s+(?:ל)?הסרה(?!\s+(?:של|את)(?!\w))",
     # Stop sending / contacting. Past tense "הפסיקו" (they stopped) needs "me".
     r"(?:תפסיק|תפסיקו|תפסיקי|הפסק|הפסיקי)\s+(?:(?:כבר|בבקשה)\s+)?" + _HE_CONTACT,
     r"(?:הפסיקו|להפסיק)\s+(?:(?:כבר|בבקשה)\s+)?" + _HE_CONTACT + r"\s+(?:" + _HE_TO_ME
     + "|" + _HE_ME + ")",
-    r"(?:נא|בבקשה)\s+להפסיק",
+    r"(?:נא|בבקשה)\s+להפסיק(?:\s+" + _HE_CONTACT + r"|(?=\s*(?:[.!]|$)))",
     # Don't contact / write to / send me.
     r"אל\s+תפנ(?:ה|ו|י)\s+(?:אליי|אלי|אלינו)",
     r"(?:אל\s+(?:תכתוב|תכתבו|תכתבי)|(?:לא|אין)\s+לכתוב)\s+" + _HE_TO_ME,
@@ -127,13 +129,34 @@ HEBREW_OPT_OUT_PATTERNS = (
 # Hebrew joins "and", "that", "to" onto the next word ("ותורידו אותי").
 HEBREW_OPT_OUT_RE = re.compile(
     r"(?<!\w)[ובכלמשה]{0,2}(?:" + "|".join(HEBREW_OPT_OUT_PATTERNS) + r")(?!\w)")
+# A match isn't final when the word before it negates or conditions it ("אל
+# תסירו אותי", "אם תפסיקו לשלוח") or its sentence narrows it to a time or a
+# channel ("לפני ספטמבר", "בוואטסאפ"). The model reads those instead.
+_HE_NOT_FINAL_BEFORE = {"אל", "לא", "אין", "אם", "ואם"}
+_HE_NOT_FINAL_AFTER_RE = re.compile(
+    r"(?<!\w)(?:לפני|אחרי|עד|בשבת|בחג|בשישי|בוואטסאפ|וואטסאפ|בטלפון|בסמס|עדיף"
+    r"|תתקשר|תתקשרו|תתקשרי|התקשר|התקשרו|התקשרי)(?!\w)")
+
+
+def _hebrew_opt_out(flat: str):
+    """The first Hebrew opt-out phrase in flat text that means it, or None."""
+    for m in HEBREW_OPT_OUT_RE.finditer(flat):
+        before = flat[:m.start()].split()
+        sentence_end = re.search(r"[.!?\n]", flat[m.end():])
+        after = flat[m.end():m.end() + sentence_end.start()] if sentence_end else flat[m.end():]
+        if (before and before[-1] in _HE_NOT_FINAL_BEFORE) or _HE_NOT_FINAL_AFTER_RE.search(after):
+            continue
+        return m
+    return None
+
+
 # "לא תודה" / "לא מעוניין, תודה" / "תודה, לא מעוניינים": one line, as with
 # "no thanks". Not "כן או לא, תודה", and not "לא מעוניין לשלם מראש, תודה"
 # or "תודה, לא מעוניין בחבילה הגדולה", which bargain rather than leave. Nor
 # "למה לא, תודה" (why not), "אם לא, תודה" (if not) or "עדיין לא, תודה" (not yet).
 _HE_FOR_NOW = r"(?:\s+(?:כרגע|בינתיים|עכשיו|בזה|בכך))?"
 HEBREW_NO_THANKS_RE = re.compile(
-    r"(?<!\w)(?<!או )(?<!למה )(?<!אם )(?<!עדיין )(?<!עוד )(?:לא[ \t,]+|" + _HE_NOT_INTERESTED + _HE_FOR_NOW + r"[ \t,.!-]*)תודה(?!\w)"
+    r"(?<!\w)(?<!או )(?<!למה )(?<!מדוע )(?<!אם )(?<!עדיין )(?<!עוד )(?:לא[ \t,]+|" + _HE_NOT_INTERESTED + _HE_FOR_NOW + r"[ \t,.!-]*)תודה(?!\w)"
     r"|(?<!\w)תודה[ \t,.!-]+(?:(?:אבל|אך)[ \t]+)?(?:(?:אני|אנחנו|אנו)[ \t]+)?"
     + _HE_NOT_INTERESTED + _HE_FOR_NOW
     + r"(?=[ \t]*(?:[.!,]|$))")
@@ -214,7 +237,7 @@ def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
         if p in flat:
             return {"rule": "phrase", "matched": p,
                     "why": f'Their reply contains "{p}".'}
-    m = HEBREW_OPT_OUT_RE.search(flat)
+    m = _hebrew_opt_out(flat)
     if m:
         return {"rule": "phrase", "matched": m.group(0),
                 "why": f'Their reply contains "{m.group(0)}".'}
