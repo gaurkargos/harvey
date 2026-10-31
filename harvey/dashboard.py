@@ -1543,25 +1543,30 @@ async def get_conversations(awaiting: bool = False):
                          if not camp or e.get("campaign_id") == camp]
         row["draft"] = drafts.get(row["id"])
     if awaiting:
-        rows += await _awaiting_reply({r.get("prospect_id") for r in rows})
+        rows += await _awaiting_reply()
     return rows
 
 
-async def _awaiting_reply(have: set) -> list[dict]:
+async def _awaiting_reply() -> list[dict]:
     """Prospects Harvey emailed who haven't replied yet, shaped like a
     conversation so the tab can show every sent email, not only the ones
     that got an answer. Read-only: no conversation row is created, and the
     card moves to the real conversation the moment a reply arrives."""
     waiting: dict[str, dict] = {}
-    for e in await query_db(
-            "SELECT o.prospect_id, o.step, o.subject, o.body, o.sent_at, "
-            "p.first_name, p.last_name, p.email AS prospect_email, p.company, "
-            "p.status AS prospect_status FROM outbox o "
-            "LEFT JOIN prospects p ON p.id = o.prospect_id "
-            "WHERE o.kind = 'sequence' AND o.status = 'sent' ORDER BY o.sent_at"):
-        pid = e.get("prospect_id")
-        if not pid or pid in have:
-            continue
+    # Only people still waiting: anyone with a conversation (even one past the
+    # tab's latest 100), a bounced address, or who's otherwise done isn't.
+    sent = await query_db(
+        "SELECT o.prospect_id, o.step, o.subject, o.body, o.sent_at, "
+        "p.first_name, p.last_name, p.email AS prospect_email, p.company, "
+        "p.status AS prospect_status FROM outbox o "
+        "JOIN prospects p ON p.id = o.prospect_id "
+        "WHERE o.kind = 'sequence' AND o.status = 'sent' "
+        "AND p.status NOT IN ('replied', 'opted_out', 'lost', 'meeting', 'closed') "
+        "AND COALESCE(p.email_status, '') != 'invalid' "
+        "AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.prospect_id = p.id) "
+        "ORDER BY o.sent_at DESC LIMIT 2000")
+    for e in reversed(sent):
+        pid = e["prospect_id"]
         row = waiting.setdefault(pid, {
             "id": "awaiting-" + pid, "prospect_id": pid, "campaign_id": "",
             "channel": "email", "intent": "", "stage": "", "status": "awaiting_reply",

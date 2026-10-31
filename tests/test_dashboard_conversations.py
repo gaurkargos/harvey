@@ -132,3 +132,48 @@ def test_awaiting_reply_creates_no_conversation_rows(client):
     with sqlite3.connect(client.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
     conn.close()
+
+
+# ── Review follow-ups ──
+
+def _emailed(db, pid, status="contacted", email_status="verified", sent="sent"):
+    asyncio.run(StateManager(str(db)).init_db())
+    _sql(db, "INSERT INTO prospects (id, company, email, status, email_status) VALUES (?, 'Co', ?, ?, ?)",
+         (pid, pid + "@co.example", status, email_status))
+    _sql(db, "INSERT INTO outbox (id, prospect_id, campaign_id, kind, step, to_email, subject, body, "
+             "status, sent_at, send_at) VALUES (?, ?, 'k1', 'sequence', 1, ?, 's', 'Hi.', ?, "
+             "'2026-10-12T09:00:00', '2026-10-12T09:00:00')",
+         ("o-" + pid, pid, pid + "@co.example", sent))
+
+
+def _awaiting(client):
+    return [r["prospect_id"] for r in client.get("/api/conversations?awaiting=1").json()
+            if r["status"] == "awaiting_reply"]
+
+
+def test_only_people_still_waiting_on_a_reply_are_awaiting(client):
+    db = client.db_path
+    _emailed(db, "waiting")
+    for status in ("replied", "opted_out", "lost", "meeting", "closed"):
+        _emailed(db, status, status=status)
+    _emailed(db, "bounced", email_status="invalid")
+    assert _awaiting(client) == ["waiting"]
+
+
+def test_a_deleted_contact_is_not_awaiting(client):
+    asyncio.run(StateManager(str(client.db_path)).init_db())
+    _sql(client.db_path, "INSERT INTO outbox (id, prospect_id, campaign_id, kind, step, to_email, subject, "
+         "body, status, sent_at, send_at) VALUES ('gone', 'nobody', 'k1', 'sequence', 1, 'x@co.example', 's', "
+         "'b', 'sent', '2026-10-12T09:00:00', '2026-10-12T09:00:00')")
+    assert _awaiting(client) == []
+
+
+def test_a_conversation_outside_the_latest_100_still_counts(client):
+    db = client.db_path
+    _emailed(db, "old")
+    _sql(db, "INSERT INTO conversations (id, prospect_id, campaign_id, channel, status, updated_at) "
+             "VALUES ('oldc', 'old', 'k1', 'email', 'closed', '2020-01-01')")
+    for i in range(100):
+        _sql(db, "INSERT INTO conversations (id, prospect_id, campaign_id, channel, status, updated_at) "
+                 "VALUES (?, ?, 'k1', 'email', 'closed', '2026-10-20')", (f"c{i}", f"q{i}"))
+    assert _awaiting(client) == []
