@@ -288,6 +288,21 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Policy-style SMTP refusals are no longer read as "invalid".** Providers
+  like Zoho answer RCPT from residential/dynamic IPs with `550 5.7.1 Mail
+  rejected ... for policy reasons. We generally do not accept email from
+  dynamic IP's` — for *every* recipient: the random control address, a
+  mailbox another verifier confirmed live the day before, even `postmaster@`
+  (measured 2026-10-31 from a home connection with no PTR: identical text
+  for all three, plus `553 5.1.2 Relaying disallowed` cross-datacentre).
+  The keyless recipient probe and the raw SMTP check now read the refusal
+  *text*: a 5xx that is about the sender or the IP (5.7.x, 5.1.2, relaying,
+  dynamic-IP, blocklist, reputation wording) stays inconclusive — the address
+  keeps its honest `guess` — while genuine user-unknown replies (5.1.1 and
+  friends) still grade `invalid`. Both paths also record the server's reply
+  text in the evidence, and `verify_email_smtp` now catches
+  `SMTPRecipientRefused` properly, so real 5xx replies are classified instead
+  of silently collapsing to "inconclusive" via the generic handler.
 - **OpenStreetMap discovery survives a bad afternoon** (from #125). A 500, 502 or
   503 from one Overpass mirror now moves on to the next instead of ending the
   search, Overpass gets enough time to get through its queue, and the mirror
