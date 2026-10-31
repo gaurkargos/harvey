@@ -593,10 +593,14 @@ class Handler:
         # left unprocessed and the retry starts from the same stored state,
         # so the thread never gets the message twice or its stage advanced
         # twice. (Stop-on-reply above is idempotent and stays first.)
-        existing_convos = await self.state.get_conversations_by_status("open")
+        # A conversation handed to you stays with you: you may have answered by
+        # hand, or it's a complaint. Later replies join it and nobody drafts.
+        existing_convos = (await self.state.get_conversations_by_status("needs_human")
+                           + await self.state.get_conversations_by_status("open"))
         stored = next(
             (c for c in existing_convos if c.prospect_id == prospect.id), None
         )
+        handed_off = stored is not None and stored.status == "needs_human"
         if stored is not None:
             convo = stored.model_copy(deep=True)
         else:
@@ -622,7 +626,7 @@ class Handler:
         listed = do_not_contact_match(prospect.email or lead_email,
                                       live_do_not_contact(self.config))
         response = ""
-        if intent in AUTO_REPLY_INTENTS and not held and not listed:
+        if intent in AUTO_REPLY_INTENTS and not held and not listed and not handed_off:
             response = await self._generate_response(intent, reply_text, prospect, convo)
 
         # 2c. Store the conversation in one write.
@@ -641,7 +645,8 @@ class Handler:
         # 3. Route based on intent
         if intent == "unsubscribe":
             # Honor opt-outs ALWAYS. No reply, no future contact.
-            await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
+            await self.state.update_conversation(
+                convo.id, status="needs_human" if handed_off else "closed", stage="closed_lost")
             await self.state.update_prospect_status(prospect.id, "opted_out")
             await self.state.log_action(
                 action_type="opt_out",
@@ -673,6 +678,11 @@ class Handler:
             )
             return
 
+        if handed_off:
+            logger.info(f"Handler: {lead_email} wrote again. Added to the conversation "
+                        "that's with you; Harvey won't answer.")
+            return
+
         if listed:
             await self.state.update_conversation(convo.id, status="needs_human")
             await self.state.log_action(
@@ -693,7 +703,11 @@ class Handler:
             return
 
         if intent == "ooo":
-            logger.info(f"Handler: {lead_email} is OOO. Will follow up later.")
+            # Their follow-ups were cancelled above and nothing re-queues
+            # them, so whether to write again is a human's call. Left 'open',
+            # the thread waited forever on a person who never saw the email.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            logger.info(f"Handler: {lead_email} sent an auto-reply. Handed to a human.")
             return
 
         if intent not in AUTO_REPLY_INTENTS:

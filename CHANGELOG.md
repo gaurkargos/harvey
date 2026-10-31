@@ -266,6 +266,14 @@ minor versions can still change behaviour.
 - **Hebrew opt-outs are honored without the model** (from #134). A reply like
   "הסר", "תורידו אותי מהרשימה" or "לא תודה" now opts out as its English
   equivalent does, and `compliance.opt_out_line` can ask for a Hebrew reply.
+- **Harvey keeps prospecting when it can't send or is waiting on a reply**
+  (from #128, #126). A draft that couldn't deploy (email channel off, or native
+  sending paused) or any open conversation used to win every cycle, so Harvey
+  stopped writing and finding prospects. Replies are now read alongside
+  whatever the cycle does, still before anything is sent. An auto-reply now
+  goes to **Needs you**. A conversation handed to you stays with you: later
+  replies join it and Harvey doesn't answer them until you hand it back. Before,
+  a reply after an escalation started a new conversation Harvey could answer.
 - **Replies remember the whole conversation** (closes #97). A reply was
   written from the last six messages only, so a requirement the prospect
   stated earlier ("synthetic data only, processed in the EU") dropped out
