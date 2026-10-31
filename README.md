@@ -13,10 +13,9 @@ $ harvey run
 Harvey is online. Always Be Closing.
 ============================================================
 Checking pipeline state...
-Decision: handle_replies (2 new replies)
+Decision: write_campaign (3 new prospects with no drafts)
   handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
   handler   → Priya Nair, Highline Roofing         objection, answer drafted
-Decision: write_campaign (3 new prospects with no drafts)
   writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
   outbox    → 5 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
