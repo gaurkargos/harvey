@@ -66,3 +66,7 @@ harvey.yaml.*
 # Runtime logs / captured CLI output (never commit)
 *.log
 train-output.txt
+
+# Local-only ops artifacts on this machine (Gauransh rule: ops/* and reports/ never go to public remotes)
+runs/
+reports/

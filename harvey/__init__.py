@@ -17,3 +17,15 @@ if sys.version_info < (3, 11):  # pragma: no cover - version guard
     )
 
 """Harvey — Autonomous Sales Agent. Always Be Closing."""
+
+# httpx logs full request URLs at INFO, and the email verifiers take their
+# API key in the query string — verification calls printed live keys into
+# heartbeat-run.log. Install the redaction filter at import so every
+# entrypoint (run, dashboard, train, the CLI) is covered before any client
+# is built. Never fail the package import over it.
+try:
+    from harvey.logredact import install as _install_query_secret_filter
+
+    _install_query_secret_filter()
+except Exception:  # pragma: no cover - belt and braces
+    pass
