@@ -233,3 +233,46 @@ async def test_a_run_puts_the_rules_in_every_prompt(state, tmp_path):
     brain = RecordingBrain(SEQ)
     await Writer(brain, state, config(provider="instantly", email_rules=str(path))).run()
     assert brain.prompts and all(RULES in p for p in brain.prompts)
+
+
+# ── Review follow-ups ──
+
+@pytest.mark.asyncio
+async def test_rules_never_lift_truthful_subject_lines(state):
+    assert 'fake "Re:"' in await personal_prompt(state, RULES)
+    assert 'fake "Re:"' in await sequence_prompt(state, RULES)
+
+
+@pytest.mark.asyncio
+async def test_unusable_rules_are_noted_for_today_and_cleared_when_fixed(state, tmp_path):
+    from harvey.agents.writer import EMAIL_RULES_PROBLEM_KEY
+    path = tmp_path / "rules.md"
+    await prospect(state)
+    w = Writer(RecordingBrain(SEQ), state, config(email_rules=str(path)))
+    await w.run()
+    assert "doesn't exist" in await state.get_setting(EMAIL_RULES_PROBLEM_KEY)
+
+    path.write_text(RULES, encoding="utf-8")
+    await w.run()
+    assert await state.get_setting(EMAIL_RULES_PROBLEM_KEY) == ""
+
+
+def test_today_says_the_writer_is_stopped(monkeypatch):
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    import harvey.dashboard as dash
+    from harvey.agents.writer import EMAIL_RULES_PROBLEM_KEY
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "harvey.db"
+        monkeypatch.setattr(dash, "DB_PATH", db)
+        dash.token_store.configure(Path(tmp) / "data" / "dashboard-token")
+        s = StateManager(str(db))
+        asyncio.run(s.init_db())
+        asyncio.run(s.set_setting(EMAIL_RULES_PROBLEM_KEY, "skills/email_rules.md doesn't exist"))
+        with TestClient(dash.app, base_url="http://127.0.0.1:5555",
+                        headers={"Authorization": f"Bearer {dash.token_store.get()}"}) as c:
+            items = c.get("/api/today").json()["items"]
+    card = next(i for i in items if i["key"] == "email-rules")
+    assert "email_rules.md doesn't exist" in card["detail"]

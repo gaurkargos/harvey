@@ -51,6 +51,8 @@ SEQUENCE_SHAPE = """- Email 1: Personalized cold observation + one question. Und
 - Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping."""
 SEQUENCE_STYLE = """- Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words."""
+# Why the Writer stopped: Today and `harvey status` show it.
+EMAIL_RULES_PROBLEM_KEY = "email_rules_problem"
 BUILT_IN_FOOTER = "- No postal address, unsubscribe or opt-out line: Harvey adds them when it sends."
 
 
@@ -67,6 +69,8 @@ def operator_rules_block(rules: str) -> str:
         "and sign-off, these replace the STRICT EMAIL RULES and skills above\n"
         "wherever the two disagree. They never override the FACTS rule: what you\n"
         "say about the prospect comes only from the facts given, never invented.\n"
+        "Nor do they allow a fake \"Re:\" or \"Fwd:\" subject line, or a claim of a\n"
+        "conversation that never happened.\n"
         + rules
     )
 
@@ -126,7 +130,10 @@ class Writer:
             logger.warning(
                 f"Writer: your email rules (writer.email_rules) can't be used: {e}. "
                 "Writing nothing until that's fixed.")
+            await self.state.set_setting(EMAIL_RULES_PROBLEM_KEY, str(e))
             return
+        if await self.state.get_setting(EMAIL_RULES_PROBLEM_KEY):
+            await self.state.delete_setting(EMAIL_RULES_PROBLEM_KEY)
 
         # Get prospects that haven't been contacted yet
         new_prospects = await self.state.get_prospects_by_status("new")
