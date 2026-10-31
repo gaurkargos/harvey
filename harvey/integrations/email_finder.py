@@ -584,10 +584,61 @@ async def verify_hunter(email: str, api_key: str) -> Optional[dict]:
     return {"status": status, "catch_all": bool(data.get("accept_all"))}
 
 
+# ── Rejection classification ──
+#
+# A 5xx refusal is only a mailbox verdict when it is about the RECIPIENT.
+# Providers like Zoho answer RCPT from residential/dynamic IPs with
+# "550 5.7.1 Mail rejected ... for policy reasons. We generally do not
+# accept email from dynamic IP's" for EVERY recipient — the random control,
+# a mailbox another verifier confirmed live the day before, even postmaster@
+# (measured 2026-10-31 from a BSNL dynamic IP with no PTR: identical 550 5.7.1
+# for all three, and 553 5.1.2 "Relaying disallowed" for cross-DC recipients).
+# Reading that as "invalid" would write off every address at every such
+# provider, so policy-style refusals must stay inconclusive.
+
+_POLICY_ENHANCED_CODES = re.compile(r"\b5\.7\.\d+\b|\b5\.1\.2\b|\b5\.4\.\d+\b")
+_POLICY_TEXT_MARKERS = (
+    "policy", "dynamic ip", "residential", "relaying", "relay ",
+    "spamhaus", "spam", "blacklist", "block list", "blocked",
+    "reputation", "access denied", "not allowed", "unauthorized",
+    "unauthenticated", "authentication", "reverse dns", "rdns", "ptr record",
+    "cannot find your hostname", "client host", "ip address",
+    "greylist", "graylist", "try again later", "rate limit", "too many",
+    "quota", "mailbox full", "service unavailable", "dns error", "banned",
+)
+
+
+def _reply_text(message) -> str:
+    """Server reply text as str (aiosmtplib gives str; tests may pass bytes)."""
+    if isinstance(message, bytes):
+        return message.decode("utf-8", "replace")
+    return str(message or "")
+
+
+def _text_snippet(message, limit: int = 160) -> str:
+    return " ".join(_reply_text(message).split())[:limit]
+
+
+def looks_like_policy_rejection(message) -> bool:
+    """True when an SMTP refusal is about the sender/IP, not the mailbox.
+
+    Conservative by design: an enhanced code of 5.7.x (security/policy),
+    5.1.2 (bad destination / relaying) or 5.4.x (routing), or any policy
+    wording in the text, marks the refusal as inconclusive. Anything else
+    550/551/553 — the endless "user unknown" variants — stays a verdict.
+    """
+    text = _reply_text(message).lower()
+    if _POLICY_ENHANCED_CODES.search(text):
+        return True
+    return any(marker in text for marker in _POLICY_TEXT_MARKERS)
+
+
 async def verify_email_smtp(email: str) -> Optional[bool]:
     """SMTP RCPT check — only trustworthy for small, self-hosted mail servers.
 
-    Returns True (accepted), False (rejected), or None (couldn't tell).
+    Returns True (accepted), False (rejected as a user/mailbox verdict), or
+    None (couldn't tell — including refusals that are about the sender or
+    this IP rather than the recipient, e.g. Zoho's dynamic-IP 550 5.7.1).
     Port 25 is blocked on most cloud hosts, so this frequently returns None.
     """
     if "@" not in email:
@@ -601,10 +652,21 @@ async def verify_email_smtp(email: str) -> Optional[bool]:
         await smtp.connect()
         await smtp.ehlo()
         await smtp.mail("verify@example.com")
-        code, _ = await smtp.rcpt(email)
-        if code == 250:
+        try:
+            response = await smtp.rcpt(email)
+            code = int(response.code)
+            message = _reply_text(getattr(response, "message", ""))
+        except aiosmtplib.SMTPRecipientRefused as e:
+            code = int(e.code)
+            message = _reply_text(getattr(e, "message", ""))
+        if code in (250, 251):
             return True
         if code in (550, 551, 553):
+            if looks_like_policy_rejection(message):
+                logger.info(
+                    "SMTP check for %s: %s refused for policy reasons, not a "
+                    "mailbox verdict (%s)", email, code, _text_snippet(message))
+                return None
             return False
         return None
     except Exception as e:
@@ -798,8 +860,12 @@ async def probe_recipient(email: str) -> Optional[dict]:
     the real candidate.
 
       control accepted                      -> catch-all  => {'status': 'catch_all'}
-      control rejected, candidate accepted  -> {'status': 'valid'}
-      control rejected, candidate rejected  -> {'status': 'invalid'}
+      control rejected (user-unknown), candidate accepted  -> {'status': 'valid'}
+      control rejected (user-unknown), candidate rejected
+        with user-unknown text              -> {'status': 'invalid'}
+      policy-style refusal on either address (5.7.x / relaying / dynamic-IP
+        blocks — about the sender, not the mailbox)
+                                           -> None (inconclusive; stays "guess")
       4xx / tarpit / timeout / no budget    -> None (inconclusive; caller keeps "guess")
 
     No key, no credit, no sender reputation: RCPT is not a delivery attempt
@@ -822,6 +888,7 @@ async def probe_recipient(email: str) -> Optional[dict]:
 
     control = f"zz-no-such-user-{random.randint(10000, 99999)}@{domain}"
     codes: dict[str, Optional[int]] = {control: None, email: None}
+    texts: dict[str, str] = {control: "", email: ""}
 
     _probe_budget["left"] -= 1
     smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=20)
@@ -833,8 +900,10 @@ async def probe_recipient(email: str) -> Optional[dict]:
             try:
                 response = await smtp.rcpt(addr)
                 codes[addr] = int(response.code)
+                texts[addr] = _reply_text(getattr(response, "message", ""))
             except aiosmtplib.SMTPRecipientRefused as e:
                 codes[addr] = int(e.code)
+                texts[addr] = _reply_text(getattr(e, "message", ""))
         try:
             await smtp.rset()
             await smtp.quit()
@@ -851,18 +920,36 @@ async def probe_recipient(email: str) -> Optional[dict]:
             pass
 
     control_code, candidate_code = codes[control], codes[email]
+    evidence = {"control": control_code, "candidate": candidate_code,
+                "control_text": _text_snippet(texts[control]),
+                "candidate_text": _text_snippet(texts[email])}
+
+    def _refused_as_missing(addr_code: Optional[int], addr_text: str) -> bool:
+        """A 5xx that is genuinely about the recipient not existing."""
+        return (
+            addr_code in (550, 551, 553)
+            and not looks_like_policy_rejection(addr_text)
+        )
+
     verdict: Optional[dict]
     if control_code == 250:
-        verdict = {"status": "catch_all", "catch_all": True,
-                   "evidence": {"control": control_code, "candidate": candidate_code}}
-    elif control_code == 550 and candidate_code == 250:
-        verdict = {"status": "valid", "catch_all": False,
-                   "evidence": {"control": control_code, "candidate": candidate_code}}
-    elif control_code == 550 and candidate_code == 550:
-        verdict = {"status": "invalid", "catch_all": False,
-                   "evidence": {"control": control_code, "candidate": candidate_code}}
+        verdict = {"status": "catch_all", "catch_all": True, "evidence": evidence}
+    elif (_refused_as_missing(control_code, texts[control])
+          and candidate_code in (250, 251)):
+        verdict = {"status": "valid", "catch_all": False, "evidence": evidence}
+    elif (_refused_as_missing(control_code, texts[control])
+          and _refused_as_missing(candidate_code, texts[email])):
+        verdict = {"status": "invalid", "catch_all": False, "evidence": evidence}
     else:
-        verdict = None  # 4xx, mixed codes, or a silent tarpit
+        verdict = None  # 4xx, mixed codes, a silent tarpit — or a policy refusal
+        if (control_code in (550, 551, 553)
+                and looks_like_policy_rejection(texts[control])) or (
+                candidate_code in (550, 551, 553)
+                and looks_like_policy_rejection(texts[email])):
+            logger.info(
+                "Recipient probe %s: refusal is about the sender/IP, not the "
+                "mailbox (%s | %s) — staying inconclusive",
+                email, _text_snippet(texts[control]), _text_snippet(texts[email]))
     logger.info(
         "Recipient probe %s: candidate=%s control=%s -> %s",
         email, candidate_code, control_code,

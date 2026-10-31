@@ -24,13 +24,17 @@ REAL_PROBE = ef.probe_recipient
 
 
 class FakeResponse:
-    def __init__(self, code):
+    def __init__(self, code, message=""):
         self.code = code
-        self.message = b""
+        self.message = message
 
 
 class FakeSMTP:
-    """Stands in for aiosmtplib.SMTP; `codes` maps address -> SMTP reply code."""
+    """Stands in for aiosmtplib.SMTP.
+
+    `codes` maps address -> SMTP reply code, or a (code, reply-text) tuple
+    (``"*"`` is the default for any unlisted address).
+    """
 
     last_instance = None
 
@@ -54,10 +58,11 @@ class FakeSMTP:
 
     async def rcpt(self, addr, options=None):
         self.sent.append(("RCPT", addr))
-        code = self.codes.get(addr, self.codes.get("*", 550))
-        if code != 250:
-            raise ef.aiosmtplib.SMTPRecipientRefused(code, b"no", addr)
-        return FakeResponse(code)
+        entry = self.codes.get(addr, self.codes.get("*", 550))
+        code, text = entry if isinstance(entry, tuple) else (entry, b"no")
+        if code not in (250, 251):
+            raise ef.aiosmtplib.SMTPRecipientRefused(code, text, addr)
+        return FakeResponse(code, text)
 
     async def rset(self):
         return FakeResponse(250)
@@ -113,7 +118,8 @@ async def test_probe_valid_when_control_rejected(monkeypatch):
     verdict = await REAL_PROBE("jane.doe@acme.com")
     assert verdict["status"] == "valid"
     assert verdict["catch_all"] is False
-    assert verdict["evidence"] == {"control": 550, "candidate": 250}
+    assert verdict["evidence"]["control"] == 550
+    assert verdict["evidence"]["candidate"] == 250
     # Control was asked first, so a catch-all can never be called valid.
     sent = FakeSMTP.last_instance.sent
     assert sent[0][0] == "MAIL"
@@ -140,6 +146,68 @@ async def test_probe_invalid_when_both_rejected(monkeypatch):
 async def test_probe_inconclusive_on_4xx(monkeypatch):
     _use_smtp(monkeypatch, {"*": 450})
     assert await REAL_PROBE("jane@acme.com") is None
+
+
+# ── policy refusals are about the sender/IP, never a mailbox verdict ──
+# Measured 2026-10-31 against mx.zoho.in from a residential IP: the exact
+# same 550 5.7.1 dynamic-IP refusal came back for the control, a mailbox
+# another verifier had confirmed live, and postmaster@.
+
+ZOHO_POLICY = (550, b"5.7.1 Mail rejected by <Zoho Mail> for policy reasons. "
+                    b"We generally do not accept email from dynamic IP's")
+GOOGLE_UNKNOWN = (550, b"5.1.1 The email account that you tried to reach "
+                       b"does not exist. Please try double-checking the "
+                       b"recipient's email address for typos")
+
+
+@pytest.mark.asyncio
+async def test_probe_policy_refusal_is_never_invalid(monkeypatch):
+    _use_smtp(monkeypatch, {"*": ZOHO_POLICY})
+    verdict = await REAL_PROBE("owner@policylocked.example")
+    assert verdict is None  # blanket dynamic-IP block: inconclusive, not invalid
+
+
+@pytest.mark.asyncio
+async def test_probe_policy_refusal_on_candidate_is_inconclusive(monkeypatch):
+    # Control refused as user-unknown, candidate refused with policy text:
+    # still about the sender — no verdict either way.
+    _use_smtp(monkeypatch, {"*": GOOGLE_UNKNOWN,
+                            "owner@policylocked.example": ZOHO_POLICY})
+    assert await REAL_PROBE("owner@policylocked.example") is None
+
+
+@pytest.mark.asyncio
+async def test_probe_relaying_disallowed_is_inconclusive(monkeypatch):
+    _use_smtp(monkeypatch, {"*": (553, b"5.1.2 Relaying disallowed")})
+    assert await REAL_PROBE("team@relaylocked.example") is None
+
+
+@pytest.mark.asyncio
+async def test_probe_records_reply_text_in_evidence(monkeypatch):
+    _use_smtp(monkeypatch, {"*": GOOGLE_UNKNOWN})
+    verdict = await REAL_PROBE("gone@acme.com")
+    assert verdict["status"] == "invalid"
+    assert "does not exist" in verdict["evidence"]["candidate_text"]
+    assert verdict["evidence"]["control"] == 550
+
+
+@pytest.mark.asyncio
+async def test_verify_email_smtp_user_unknown_is_a_verdict(monkeypatch):
+    _use_smtp(monkeypatch, {"*": GOOGLE_UNKNOWN})
+    assert await ef.verify_email_smtp("gone@acme.com") is False
+
+
+@pytest.mark.asyncio
+async def test_verify_email_smtp_policy_refusal_is_inconclusive(monkeypatch):
+    _use_smtp(monkeypatch, {"*": ZOHO_POLICY})
+    assert await ef.verify_email_smtp("owner@policylocked.example") is None
+
+
+@pytest.mark.asyncio
+async def test_detect_catch_all_survives_policy_refusals(monkeypatch):
+    """A policy-blocked server must not be recorded as 'not catch-all'."""
+    _use_smtp(monkeypatch, {"*": ZOHO_POLICY})
+    assert await ef.detect_catch_all("policylocked.example") is None
 
 
 @pytest.mark.asyncio
