@@ -263,6 +263,9 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Hebrew opt-outs are honored without the model** (from #134). A reply like
+  "הסר", "תורידו אותי מהרשימה" or "לא תודה" now opts out as its English
+  equivalent does, and `compliance.opt_out_line` can ask for a Hebrew reply.
 - **Replies remember the whole conversation** (closes #97). A reply was
   written from the last six messages only, so a requirement the prospect
   stated earlier ("synthetic data only, processed in the EU") dropped out

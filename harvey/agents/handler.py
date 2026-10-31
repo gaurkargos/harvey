@@ -129,10 +129,11 @@ HEBREW_OPT_OUT_RE = re.compile(
     r"(?<!\w)[ובכלמשה]{0,2}(?:" + "|".join(HEBREW_OPT_OUT_PATTERNS) + r")(?!\w)")
 # "לא תודה" / "לא מעוניין, תודה" / "תודה, לא מעוניינים": one line, as with
 # "no thanks". Not "כן או לא, תודה", and not "לא מעוניין לשלם מראש, תודה"
-# or "תודה, לא מעוניין בחבילה הגדולה", which bargain rather than leave.
+# or "תודה, לא מעוניין בחבילה הגדולה", which bargain rather than leave. Nor
+# "למה לא, תודה" (why not), "אם לא, תודה" (if not) or "עדיין לא, תודה" (not yet).
 _HE_FOR_NOW = r"(?:\s+(?:כרגע|בינתיים|עכשיו|בזה|בכך))?"
 HEBREW_NO_THANKS_RE = re.compile(
-    r"(?<!\w)(?<!או )(?:לא[ \t,]+|" + _HE_NOT_INTERESTED + _HE_FOR_NOW + r"[ \t,.!-]*)תודה(?!\w)"
+    r"(?<!\w)(?<!או )(?<!למה )(?<!אם )(?<!עדיין )(?<!עוד )(?:לא[ \t,]+|" + _HE_NOT_INTERESTED + _HE_FOR_NOW + r"[ \t,.!-]*)תודה(?!\w)"
     r"|(?<!\w)תודה[ \t,.!-]+(?:(?:אבל|אך)[ \t]+)?(?:(?:אני|אנחנו|אנו)[ \t]+)?"
     + _HE_NOT_INTERESTED + _HE_FOR_NOW
     + r"(?=[ \t]*(?:[.!,]|$))")

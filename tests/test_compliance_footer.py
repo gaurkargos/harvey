@@ -656,3 +656,24 @@ def test_opt_out_line_can_ask_in_hebrew():
     ):
         with pytest.raises(pydantic.ValidationError):
             ComplianceConfig(opt_out_line=bad)
+
+
+# ── Review follow-ups ──
+
+from harvey.agents.handler import _opt_out_reason  # noqa: E402
+
+@pytest.mark.parametrize("reply", [
+    "למה לא, תודה",                # why not, thanks: they're interested
+    "למה לא, תודה רבה!",
+    "אשמח לשמוע. אם לא, תודה בכל מקרה",  # if not, thanks anyway
+    "ואם לא, תודה",
+    "עדיין לא, תודה ששאלת",        # not yet, thanks for asking
+    "עוד לא, תודה",
+])
+def test_hebrew_no_that_isnt_no_thanks_keeps_the_lead(reply):
+    assert _opt_out_reason(reply, reply) is None
+
+
+@pytest.mark.parametrize("reply", ["לא תודה", "לא, תודה", "בינתיים לא, תודה", "‏לא תודה‏"])
+def test_hebrew_no_thanks_still_opts_out(reply):
+    assert _opt_out_reason(reply, reply)["rule"] == "no_thanks"
