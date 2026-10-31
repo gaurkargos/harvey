@@ -5,6 +5,7 @@ import logging
 import signal
 import sys
 from datetime import datetime, time, timedelta
+from time import monotonic
 
 import pytz
 
@@ -38,6 +39,12 @@ ERROR_BACKOFF_CAP = 900
 # heartbeat loop down silently with it. This is the only thing standing
 # between one stuck agent and Harvey freezing for hours with no agent
 # knowing it's dead — found in production after exactly that happened.
+#
+# Agents that make many model calls plan against this bound (the Writer is
+# handed it as a deadline) so legitimate slow work spreads across cycles
+# instead of being cancelled mid-draft — the ceiling stays a hang guard,
+# not a throughput cap. Heavy write cycles were cancelled here in
+# production (2026-10-29/30), wasting every in-flight draft.
 CYCLE_TIMEOUT_SECONDS = 600
 
 # Cap on a single quiet-hours sleep chunk. See the quiet-hours block in
@@ -119,6 +126,16 @@ def _new_counts(summary: dict) -> tuple[int, int]:
     return new, writable
 
 
+def _native_email(config) -> bool:
+    """Whether mail goes out through a native provider. That is what a draft
+    looks like there (an outbox row) versus a campaign on a legacy provider,
+    so the writable count the heartbeat decides from must know it."""
+    try:
+        return config.channels.email.provider in NATIVE_PROVIDERS
+    except AttributeError:
+        return False
+
+
 def unusable_backlog_notice(summary: dict) -> str:
     """Why Harvey paused prospecting for the day, or ""."""
     _, writable = _new_counts(summary)
@@ -153,7 +170,7 @@ async def decide_next_action(
     stayed open, and one waiting on the prospect can stay open for weeks.
     """
     if summary is None:
-        summary = await state.get_state_summary()
+        summary = await state.get_state_summary(native_email=_native_email(config))
 
     # Only prospects the Writer can draft for trigger writing: one with a
     # guessed email stays 'new' for good, and counting it starved Scout.
@@ -175,7 +192,7 @@ async def decide_next_action(
     if deployable > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
     elif writable > 0:
-        action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
+        action, reason = "write_campaign", f"{writable} prospect(s) with no draft ready"
     elif unusable_backlog_notice(summary):
         action, reason = "idle", "a day's worth of prospects with no usable email"
         logger.warning(unusable_backlog_notice(summary))
@@ -384,7 +401,9 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 action = "quiet_hours_send"
             else:
                 logger.info("Checking pipeline state...")
-                summary = await state.get_state_summary()
+                summary = await state.get_state_summary(
+                    native_email=_native_email(config)
+                )
                 action = await decide_next_action(brain, state, config, summary=summary)
 
             # 5. Execute — run independent agents in parallel where possible
@@ -399,7 +418,15 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 # Analyst is cheap (no Claude calls) — keep analytics fresh
                 tasks.append(("analyze", analyst.run()))
             elif action == "write_campaign":
-                tasks.append(("write_campaign", writer.run()))
+                # The writer plans its batches against the same bound that
+                # cancels this gather: a batch that won't fit what's left of
+                # the cycle waits for the next heartbeat instead of being
+                # cancelled mid-draft (its in-flight model calls wasted, its
+                # prospects still 'new' so the next cycle pays again).
+                tasks.append((
+                    "write_campaign",
+                    writer.run(deadline=monotonic() + CYCLE_TIMEOUT_SECONDS),
+                ))
             elif action == "idle":
                 tasks.append(("analyze", analyst.run()))
 

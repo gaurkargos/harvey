@@ -9,9 +9,12 @@ Steps 2-3 stay campaign-level (proof point + breakup are less personal by
 design). Every draft still passes the deterministic pre-send gate.
 """
 
+import asyncio
 import json
 import logging
+import math
 import re
+import time
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
@@ -19,9 +22,14 @@ from harvey.config import EmailRulesError, HarveyConfig, compliance_of, load_ema
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
 from harvey.sending_mode import sync_sending_mode
 from harvey.startups import startup_facts
+from harvey.state import (
+    MAX_WRITE_ATTEMPTS,
+    PERSONAL_ATTEMPTS_KEY,
+    WRITABLE_EMAIL_STATUSES,
+    StateManager,
+)
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
@@ -29,7 +37,10 @@ logger = logging.getLogger("harvey.writer")
 # How many times the model may fail to write a usable sequence for a
 # prospect before Harvey stops trying (status 'write_failed'). A provider
 # outage never counts; only a reply that came back unusable does.
-MAX_WRITE_ATTEMPTS = 3
+# PERSONAL_ATTEMPTS_KEY is the same cap for a personalized first email
+# written into a campaign that already exists; there the campaign template
+# stands in instead of a 'write_failed' status. Both live in harvey.state
+# because its queries stop at them.
 WRITE_ATTEMPTS_KEY = "write_attempts:"
 
 # Merge variables that name a person; a company inbox has none of them.
@@ -97,6 +108,23 @@ def footer_rule(config, rules: str) -> str:
             "- Harvey adds no opt-out line. If the operator's rules give a sentence that\n"
             "  lets the reader say no, write it into the body as they say.")
     return "\n".join(lines)
+# A batch's personal drafts are independent brain calls (one prospect
+# each), so they run concurrently instead of one at a time. The cap keeps a
+# full 8-prospect batch from firing eight CLI calls at once: a subscription
+# rate-limits, and every retry burns time the cycle doesn't have.
+PERSONAL_DRAFT_CONCURRENCY = 3
+
+# Rough wall-clock cost of one model call, measured on the usage ledger
+# (sequence ~90s avg / ~160s max, personal email ~45s avg / ~170s max).
+# The Writer checks these against the heartbeat's cycle bound before
+# STARTING another unit of work: one that won't fit what's left of the
+# cycle waits for the next heartbeat — the same "leftovers ride the next
+# cycle" contract as the caps above — instead of being cancelled mid-draft
+# by the cycle bound, which wastes every in-flight call and makes the next
+# cycle pay for them again.
+SEQUENCE_BUDGET_SECONDS = 150
+PERSONAL_BUDGET_SECONDS = 60
+HUMANIZE_BUDGET_SECONDS = 45
 
 
 class Writer:
@@ -116,8 +144,16 @@ class Writer:
     def is_native(self) -> bool:
         return self.config.channels.email.provider in NATIVE_PROVIDERS
 
-    async def run(self):
-        """Create email campaigns for prospects that need outreach."""
+    async def run(self, deadline: float | None = None):
+        """Create email campaigns for prospects that need outreach.
+
+        ``deadline`` is a time.monotonic() timestamp marking the end of this
+        heartbeat cycle's hard bound (main.CYCLE_TIMEOUT_SECONDS, which
+        cancels the whole agent gather). Once something has been written
+        this run, a batch whose estimated cost doesn't fit the time left
+        waits for the next cycle rather than starting and being cancelled
+        mid-draft. None (tests, direct calls) keeps the ungated behavior.
+        """
         logger.info("Writer: Crafting email campaigns...")
 
         # Load foundational skills for this agent
@@ -135,9 +171,50 @@ class Writer:
         if await self.state.get_setting(EMAIL_RULES_PROBLEM_KEY):
             await self.state.delete_setting(EMAIL_RULES_PROBLEM_KEY)
 
+        # Whether any model work has been started this run — the first unit
+        # always runs (see _fits), so a full cycle is never spent deciding
+        # not to write.
+        started = False
+
+        # Prospects that entered the table as 'queued' (an import, an ops
+        # run) never match the 'new' query below. Ones already in a campaign
+        # only lack their personalized first email — stage it into that
+        # campaign; the rest join the 'new' prospects through the normal
+        # flow, so nothing sits queued forever without a draft. Capped like
+        # the batches below: the rest are picked up on later cycles.
+        stranded = await self.state.get_stranded_queued_prospects(
+            native=self.is_native,
+            limit=NATIVE_BATCH_CAP if self.is_native else LEGACY_BATCH_CAP,
+        )
+        fresh = []
+        if stranded:
+            campaigns = await self.state.get_campaigns_for_prospects(
+                [p.id for p in stranded]
+            )
+            by_campaign: dict[str, tuple] = {}
+            for p in stranded:
+                campaign = campaigns.get(p.id)
+                if campaign is None:
+                    fresh.append(p)
+                else:
+                    by_campaign.setdefault(campaign.id, (campaign, []))[1].append(p)
+            for campaign, prospects in by_campaign.values():
+                # Stranded drafts run one at a time (see _repersonalize), so
+                # their estimate is a plain per-prospect sum.
+                estimate = self._personal_estimate(len(prospects))
+                if not self._fits(deadline, started, estimate):
+                    logger.info(
+                        f"Writer: leaving {len(prospects)} stranded draft(s) in "
+                        f"'{campaign.name}' for the next cycle — not enough of "
+                        "this one left to write them."
+                    )
+                    continue
+                started = True
+                await self._repersonalize(campaign, prospects)
+
         # Get prospects that haven't been contacted yet
         new_prospects = await self.state.get_prospects_by_status("new")
-        if not new_prospects:
+        if not new_prospects and not fresh:
             logger.info("Writer: No new prospects to write for.")
             return
 
@@ -145,7 +222,7 @@ class Writer:
         # invalid addresses are skipped so we don't spend Claude calls (or
         # sending reputation) on mail that will bounce.
         prospects_with_email = [
-            p for p in new_prospects
+            p for p in new_prospects + fresh
             if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
         ]
         # Someone at their company already replied: no cold email to write.
@@ -166,6 +243,15 @@ class Writer:
             if not prospects:
                 continue
 
+            if not self._fits(deadline, started, self._batch_estimate(prospects)):
+                logger.info(
+                    f"Writer: leaving campaign '{batch_name}' "
+                    f"({len(prospects)} prospect(s)) for the next cycle — not "
+                    "enough of this one left to draft it."
+                )
+                continue
+
+            started = True
             logger.info(
                 f"Writer: Creating campaign '{batch_name}' for "
                 f"{len(prospects)} prospects."
@@ -223,6 +309,44 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
+    def _fits(self, deadline: float | None, started: bool, estimate: float) -> bool:
+        """Whether this run may start another unit of model work.
+
+        No deadline (tests, direct calls): always. The first unit: always —
+        a cycle must make progress even when one batch can't fit the whole
+        bound, and the heartbeat's hard cancel still catches a truly
+        runaway batch. After that, a unit that won't fit the time left
+        waits for the next cycle instead of being cancelled mid-flight.
+        """
+        if deadline is None or not started:
+            return True
+        return time.monotonic() + estimate <= deadline
+
+    def _personal_estimate(self, count: int) -> float:
+        """Rough seconds for `count` personal drafts plus their polish.
+        Stranded drafts run one at a time, so each draft costs a full slot."""
+        per = PERSONAL_BUDGET_SECONDS
+        if humanizer_enabled(self.config):
+            per += HUMANIZE_BUDGET_SECONDS
+        return count * per
+
+    def _batch_estimate(self, prospects: list) -> float:
+        """Rough seconds to write one campaign batch: one sequence call,
+        then the personal drafts in PERSONAL_DRAFT_CONCURRENCY-sized waves
+        (native mode only; a partial last wave costs like a full one, so
+        the estimate errs high, never low), plus the humanizer pass."""
+        if not prospects:
+            return 0.0
+        estimate = SEQUENCE_BUDGET_SECONDS
+        if self.is_native:
+            waves = math.ceil(len(prospects) / PERSONAL_DRAFT_CONCURRENCY)
+            estimate += waves * PERSONAL_BUDGET_SECONDS
+            if humanizer_enabled(self.config):
+                estimate += len(prospects) * HUMANIZE_BUDGET_SECONDS
+        elif humanizer_enabled(self.config):
+            estimate += 3 * HUMANIZE_BUDGET_SECONDS  # the three sequence steps
+        return estimate
+
     async def _count_failed_attempt(self, batch_name: str, prospects: list):
         """Count one unusable sequence against each prospect in the batch.
 
@@ -255,14 +379,78 @@ class Writer:
                 f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
-        """Draft a grounded, per-prospect email 1 and stage it in the outbox.
+    async def _repersonalize(self, campaign, prospects: list):
+        """Stage the personalized first email 'queued' prospects are missing.
 
-        The outbox unique index means the sender's later template staging
-        can't overwrite these rows — a personalized draft always wins the
-        (campaign, prospect, step 1) slot. If a draft fails, the slot stays
-        empty and the sender falls back to the campaign template.
+        They already belong to a campaign — an ops run staged one, or the
+        Writer's own campaign outlived a failed personalization — so no new
+        campaign is written and no sequence call is spent: the missing step-1
+        draft goes into the campaign they have, and the outbox's unique
+        (campaign, prospect, step) slot keeps it single. A draft that keeps
+        coming back unusable gives up after MAX_WRITE_ATTEMPTS tries and the
+        campaign template stands in, exactly as for a fresh campaign whose
+        personalization failed.
+
+        Drafts run one at a time, unlike _personalize_first_emails: the
+        outage check below reads the brain's last_reply_empty right after
+        each call, and concurrent calls would overwrite each other's flag.
         """
+        logger.info(
+            f"Writer: drafting the missing first email for {len(prospects)} "
+            f"prospect(s) already queued in '{campaign.name}'."
+        )
+        pending = []
+        for prospect in prospects:
+            try:
+                draft = await self._write_personal_email(prospect)
+            except Exception as e:
+                # Same contract as a fresh campaign's personalization: skip
+                # this one, don't count it, let a later cycle try again.
+                logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
+                continue
+            if draft:
+                await self.state.delete_setting(PERSONAL_ATTEMPTS_KEY + prospect.id)
+                pending.append((prospect, draft))
+                continue
+            if getattr(self.brain, "last_reply_empty", False):
+                # No reply at all (logout, rate limit, timeout): not the
+                # model's fault, nothing to count, and the rest of the batch
+                # would come back just as empty.
+                return
+            if await self._count_personal_attempt(prospect):
+                logger.warning(
+                    f"Writer: {MAX_WRITE_ATTEMPTS} unusable first emails for "
+                    f"{prospect.email}; the '{campaign.name}' template stands in."
+                )
+        drafted = await self._stage_personal_drafts(pending, campaign.id)
+        if drafted:
+            await self.state.log_action(
+                action_type="write_campaign",
+                agent="writer",
+                details={
+                    "campaign_id": campaign.id,
+                    "campaign_name": campaign.name,
+                    "prospect_count": drafted,
+                    "personalized_only": True,
+                },
+            )
+
+    async def _count_personal_attempt(self, prospect) -> bool:
+        """Count one unusable personalized first email for a prospect whose
+        campaign already exists. Returns True at the cap, where the campaign
+        template takes over for good (the key stays at the cap value so the
+        stranded queries stop offering this prospect)."""
+        key = PERSONAL_ATTEMPTS_KEY + prospect.id
+        try:
+            attempts = int(await self.state.get_setting(key) or 0) + 1
+        except ValueError:
+            attempts = 1
+        await self.state.set_setting(key, str(attempts))
+        return attempts >= MAX_WRITE_ATTEMPTS
+
+    async def _stage_personal_drafts(self, pending: list, campaign_id: str) -> int:
+        """Polish and stage (prospect, draft) pairs as step-1 outbox rows.
+        Returns how many landed in the outbox."""
         await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
@@ -270,16 +458,6 @@ class Writer:
         status = "pending_review" if require_approval else "approved"
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
-
-        pending = []
-        for prospect in prospects:
-            try:
-                draft = await self._write_personal_email(prospect)
-            except Exception as e:
-                logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
-                continue
-            if draft:
-                pending.append((prospect, draft))
 
         # One Humanizer pass over the whole batch before anything is staged.
         polished = await humanize(
@@ -309,6 +487,37 @@ class Writer:
                 f"Writer: drafted {drafted} personalized first email(s) "
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
+        return drafted
+
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+        """Draft a grounded, per-prospect email 1 and stage it in the outbox.
+
+        The outbox unique index means the sender's later template staging
+        can't overwrite these rows — a personalized draft always wins the
+        (campaign, prospect, step 1) slot. If a draft fails, the slot stays
+        empty and the sender falls back to the campaign template.
+
+        Each draft is an independent brain call, so they run concurrently
+        (bounded by PERSONAL_DRAFT_CONCURRENCY): a full batch costs one
+        sequence call plus a few personal waves, not one call per prospect
+        in a row — which is what pushed 3-campaign cycles past the
+        heartbeat's cycle bound in production.
+        """
+        gate = asyncio.Semaphore(PERSONAL_DRAFT_CONCURRENCY)
+
+        async def draft_for(prospect):
+            async with gate:
+                try:
+                    return prospect, await self._write_personal_email(prospect)
+                except Exception as e:
+                    logger.warning(
+                        f"Writer: personal draft failed for {prospect.email}: {e}"
+                    )
+                    return prospect, None
+
+        results = await asyncio.gather(*(draft_for(p) for p in prospects))
+        pending = [(prospect, draft) for prospect, draft in results if draft]
+        await self._stage_personal_drafts(pending, campaign_id)
 
     async def _startup(self, company_id) -> list[str] | None:
         """Fact lines when the company is a startup (YC, another accelerator,

@@ -138,13 +138,34 @@ async def test_held_drafts_do_not_block_writing_or_prospecting(new, expected):
 
 
 @pytest.mark.asyncio
-async def test_drafts_still_deploy_on_instantly_autopilot_and_native_providers():
+async def test_drafts_still_deploy_on_instantly_autopilot():
     from harvey.main import decide_next_action
     summary = {"prospects": {"new": 30}, "draft_campaigns": 1, "open_conversations": 0}
     assert await decide_next_action(None, None, legacy_config(False), summary=summary) == "send_campaign"
+
+
+@pytest.mark.asyncio
+async def test_native_draft_campaigns_do_not_starve_the_writer():
+    # PR #133's original rule — a native draft campaign never wins
+    # send_campaign — predates the Outbox-native sender, which stages the
+    # campaign's emails and marks it 'active', so an undeployable native
+    # draft is no longer permanent. What must not starve the writer are
+    # the cases the held rule covers: the kill switch and the channel off.
+    from harvey.main import decide_next_action
+    summary = {"prospects": {"new": 30}, "draft_campaigns": 1, "open_conversations": 0}
     native = legacy_config()
     native.channels.email.provider = "gmail"
+    # Channel on, nothing paused: send_campaign runs — the sender drains
+    # the Outbox and moves the campaign out of 'draft' as it stages.
     assert await decide_next_action(None, None, native, summary=summary) == "send_campaign"
+    # Kill switch on: staging stops, writing and prospecting don't.
+    paused = {**summary, "sending_paused": True}
+    assert await decide_next_action(None, None, native, summary=paused) == "write_campaign"
+    # Channel off (the list-building setup): once nothing is writable,
+    # prospect instead of re-choosing a campaign that can never deploy.
+    native.channels.email.enabled = False
+    idle = {**summary, "prospects": {"new": 0}}
+    assert await decide_next_action(None, None, native, summary=idle) == "prospect"
 
 
 def test_held_instantly_is_announced_plainly():
