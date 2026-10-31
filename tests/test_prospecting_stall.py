@@ -227,37 +227,58 @@ async def _all_conversations(state):
 
 
 @pytest.mark.asyncio
-async def test_a_real_reply_after_an_auto_reply_continues_the_same_conversation(tmp_path, monkeypatch):
+async def test_a_real_reply_after_an_auto_reply_stays_in_the_thread_with_you(tmp_path, monkeypatch):
+    # You may already have answered by hand, so Harvey doesn't draft over you.
     state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "interested"])
     await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
     await handler._process_reply("jane@acme.example", "Back now. Tell me more.", "u2")
 
     convos = await _all_conversations(state)
-    assert len(convos) == 1
+    assert len(convos) == 1 and convos[0].status == "needs_human"
     assert [m.content for m in convos[0].thread if m.sender == "prospect"] == [
         "I'm away until Monday.", "Back now. Tell me more."]
-    assert convos[0].status == "open"
+    assert await state.get_outbox() == []
 
 
 @pytest.mark.asyncio
-async def test_a_second_auto_reply_keeps_one_conversation_with_you(tmp_path, monkeypatch):
-    state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "ooo"])
-    await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
-    await handler._process_reply("jane@acme.example", "Still away.", "u2")
-
-    convos = await _all_conversations(state)
-    assert len(convos) == 1 and convos[0].status == "needs_human"
-
-
-@pytest.mark.asyncio
-async def test_a_reply_after_an_escalation_stays_with_you(tmp_path, monkeypatch):
-    # Only an auto-reply's hand-off reopens: an angry thread is never resumed.
+async def test_a_reply_after_an_escalation_is_never_answered(tmp_path, monkeypatch):
     state, handler, pid = await _handler(tmp_path, monkeypatch, ["escalate", "interested"])
     await handler._process_reply("jane@acme.example", "Stop this now.", "u1")
     await handler._process_reply("jane@acme.example", "Tell me more.", "u2")
 
-    first = (await state.get_conversations_by_status("needs_human"))[0]
-    assert [m.content for m in first.thread if m.sender == "prospect"] == ["Stop this now."]
+    convos = await _all_conversations(state)
+    assert len(convos) == 1 and convos[0].status == "needs_human"
+    assert await state.get_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_an_opt_out_after_a_hand_off_still_opts_out(tmp_path, monkeypatch):
+    state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "unsubscribe"])
+    await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
+    await handler._process_reply("jane@acme.example", "Please take me off.", "u2")
+
+    assert (await state.get_prospect(pid)).status == "opted_out"
+    assert len(await _all_conversations(state)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_handed_back_to_harvey_is_answered_again(tmp_path, monkeypatch):
+    state, handler, pid = await _handler(tmp_path, monkeypatch, ["ooo", "interested"])
+    await handler._process_reply("jane@acme.example", "I'm away until Monday.", "u1")
+    convo = (await state.get_conversations_by_status("needs_human"))[0]
+    await state.update_conversation(convo.id, status="open")
+    await handler._process_reply("jane@acme.example", "Back now. Tell me more.", "u2")
+
+    assert len(await state.get_outbox()) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_auto_reply_hand_off_keeps_instantly_replies_being_read(state):
+    from harvey.models.conversation import Conversation
+    await state.add_conversation(Conversation(
+        id="", prospect_id="p", campaign_id="", channel="email", intent="ooo", status="needs_human"))
+    summary = await state.get_state_summary()
+    assert summary["open_conversations"] == 0 and summary["auto_reply_handoffs"] == 1
 
 
 def _instantly_with_a_draft_and_an_open_conversation(monkeypatch, state, calls, stop, read_ok):
