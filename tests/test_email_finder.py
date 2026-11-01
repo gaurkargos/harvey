@@ -221,6 +221,102 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
     assert not result.verified
 
 
+# ── second-format retry after an invalid guess (2026-10-30) ──
+
+
+def variant_env(monkeypatch, answers):
+    """A Reoon stand-in that grades by address from ``answers``."""
+    calls = []
+
+    async def fake_reoon(email, key):
+        calls.append(email)
+        status = answers.get(email, "invalid")
+        return {"status": status, "catch_all": False}
+
+    monkeypatch.setattr(ef, "verify_reoon", fake_reoon)
+    return calls
+
+
+async def google_mx(domain):
+    return "aspmx.l.google.com"
+
+
+@pytest.mark.asyncio
+async def test_invalid_guess_buys_the_next_format(state, monkeypatch):
+    """first.last@ dead does not mean the person is: jsmith@ may be live."""
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = variant_env(monkeypatch, {"jdoe@acme.com": "valid"})
+
+    result = await find_email("Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+
+    assert result.status == "verified"
+    assert result.email == "jdoe@acme.com"
+    assert result.pattern == "{fi}{l}"
+    # the default guess first, then the next format in likelihood order
+    assert calls == ["jane.doe@acme.com", "janedoe@acme.com", "jdoe@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_every_format_tried_stays_invalid_and_says_so(state, monkeypatch):
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = variant_env(monkeypatch, {})
+
+    result = await find_email("Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+
+    assert result.status == "invalid"
+    assert result.email == "jane.doe@acme.com"      # the likeliest one kept
+    assert len(calls) == 1 + ef.DEFAULT_PATTERN_VARIANTS
+    assert result.evidence["variants_tried"] == calls
+
+
+@pytest.mark.asyncio
+async def test_variant_retries_can_be_switched_off(state, monkeypatch):
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setenv("HARVEY_PATTERN_VARIANTS", "0")
+    calls = variant_env(monkeypatch, {"jdoe@acme.com": "valid"})
+
+    result = await find_email("Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+
+    assert result.status == "invalid"
+    assert calls == ["jane.doe@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_known_format_is_not_re_guessed(state, monkeypatch):
+    """The site tied an address to this person: an invalid verdict is final."""
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = variant_env(monkeypatch, {"jdoe@acme.com": "valid"})
+
+    result = await find_email(
+        "Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state,
+        known_emails=[("janedoe@acme.com", "Jane", "Doe")],
+    )
+
+    assert result.status == "invalid"
+    assert result.email == "janedoe@acme.com"
+    assert calls == ["janedoe@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_another_persons_likely_mailbox_is_never_variant_tried(state, monkeypatch):
+    """jdoe@ belongs to the other Jane Doe-named person: not her guess."""
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = variant_env(monkeypatch, {"jdoe@acme.com": "valid"})
+
+    result = await find_email(
+        "Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state,
+        other_people=[("Joe", "Doe")],
+    )
+
+    assert result.status == "invalid"
+    assert "jdoe@acme.com" not in calls
+
+
 # ── shared Hunter domain-search budget ──
 
 
