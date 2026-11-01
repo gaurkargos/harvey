@@ -303,6 +303,15 @@ minor versions can still change behaviour.
   text in the evidence, and `verify_email_smtp` now catches
   `SMTPRecipientRefused` properly, so real 5xx replies are classified instead
   of silently collapsing to "inconclusive" via the generic handler.
+- **API keys no longer land in the logs.** httpx logs every request at INFO as
+  `HTTP Request: GET <full-url>`, and the email verifiers take their API key
+  in the query string — so every Reoon verification and Hunter domain search
+  printed the live key into whatever captured Harvey's output. A filter on
+  the httpx logger, installed the moment the `harvey` package is imported,
+  now blanks credential-bearing query parameters (`key`, `api_key`, `token`,
+  `secret`, …) before the line reaches any handler: `…&key=[REDACTED]&…`. The
+  line keeps host, path and every other parameter byte for byte, so it still
+  says what was called and how it answered. The request itself is untouched.
 - **OpenStreetMap discovery survives a bad afternoon** (from #125). A 500, 502 or
   503 from one Overpass mirror now moves on to the next instead of ending the
   search, Overpass gets enough time to get through its queue, and the mirror
