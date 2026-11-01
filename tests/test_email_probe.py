@@ -316,6 +316,283 @@ async def test_verify_address_regrades_a_stored_guess(state, monkeypatch):
     assert ef.last_probe_evidence("jane.doe@acme.com")["status"] == "valid"
 
 
+# ── an auth/quota-dead key must not block the keyless probe ──
+#
+# A revoked Reoon key (403) or an exhausted Hunter quota (429) comes back
+# every month. Such a key can't decide anything for anyone, so it counts as
+# absent and the probe answers — instead of freezing every new address at
+# 'guess' until someone fixes the key.
+
+
+@pytest.mark.parametrize("mx_host", [
+    "aspmx.l.google.com",                       # google
+    "contoso-com.mail.protection.outlook.com",  # microsoft
+    "mx01-0001f001.pphosted.net",               # gateway
+])
+@pytest.mark.asyncio
+async def test_dead_verifier_key_falls_through_to_probe(state, monkeypatch, mx_host):
+    async def mx(domain):
+        return mx_host
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "valid", "catch_all": False,
+                "evidence": {"control": 550, "candidate": 250}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def revoked_reoon(email, key):
+        raise ef.VerifierUnavailable("Reoon HTTP 403")
+
+    monkeypatch.setattr(ef, "verify_reoon", revoked_reoon)
+
+    result = await ef.find_email(
+        "Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+    assert result.status == "verified"
+    assert calls == ["jane.doe@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_dead_hunter_quota_falls_through_to_probe(state, monkeypatch):
+    async def mx(domain):
+        return "aspmx.l.google.com"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+
+    async def unreachable(domain, key):
+        raise ef.HunterUnavailable("HTTP 429")  # pattern lookup: transient
+
+    monkeypatch.setattr(ef, "_hunter_domain_pattern", unreachable)
+
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "catch_all", "catch_all": True, "evidence": {}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def exhausted_hunter(email, key):
+        raise ef.VerifierUnavailable("Hunter HTTP 429")
+
+    monkeypatch.setattr(ef, "verify_hunter", exhausted_hunter)
+
+    result = await ef.find_email("Jane", "Doe", "acme.com", env=Env(), state=state)
+    assert result.status == "risky"  # the probe's catch-all verdict, not "guess"
+    assert calls == ["jane.doe@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_live_channel_beats_the_probe_despite_a_dead_one(state, monkeypatch):
+    async def mx(domain):
+        return "aspmx.l.google.com"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "valid", "catch_all": False, "evidence": {}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def dead_zerobounce(email, key):
+        raise ef.VerifierUnavailable("ZeroBounce HTTP 401")
+
+    monkeypatch.setattr(ef, "verify_zerobounce", dead_zerobounce)
+
+    async def live_reoon(email, key):
+        return {"status": "safe", "catch_all": False}
+
+    monkeypatch.setattr(ef, "verify_reoon", live_reoon)
+
+    result = await ef.find_email(
+        "Jane", "Doe", "acme.com",
+        env=Env(reoon="k", zerobounce="k"), state=state)
+    assert result.status == "verified"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_unknown_channel_still_blocks_the_probe(state, monkeypatch):
+    """A reachable verifier that can't decide means 'guess', even when the
+    other channel is dead: the probe is a fallback for an unreachable API
+    tier, not a cheat around a working one."""
+    async def mx(domain):
+        return "aspmx.l.google.com"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "valid", "catch_all": False, "evidence": {}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def dead_zerobounce(email, key):
+        raise ef.VerifierUnavailable("ZeroBounce HTTP 403")
+
+    monkeypatch.setattr(ef, "verify_zerobounce", dead_zerobounce)
+
+    async def uncertain_reoon(email, key):
+        return {"status": "unknown", "catch_all": False}
+
+    monkeypatch.setattr(ef, "verify_reoon", uncertain_reoon)
+
+    result = await ef.find_email(
+        "Jane", "Doe", "acme.com",
+        env=Env(reoon="k", zerobounce="k"), state=state)
+    assert result.status == "guess"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_dead_keys_still_respect_the_env_switch(state, monkeypatch):
+    async def mx(domain):
+        return "aspmx.l.google.com"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "valid", "catch_all": False, "evidence": {}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def revoked_reoon(email, key):
+        raise ef.VerifierUnavailable("Reoon HTTP 403")
+
+    monkeypatch.setattr(ef, "verify_reoon", revoked_reoon)
+
+    result = await ef.find_email(
+        "Jane", "Doe", "acme.com", env=Env(reoon="k", smtp_probe=False), state=state)
+    assert result.status == "guess"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_small_host_dead_reoon_falls_to_smtp(state, monkeypatch):
+    """Small/self-hosted domains keep their order — Reoon, then SMTP — and a
+    dead Reoon key just means SMTP answers, as it already would keyless."""
+    async def mx(domain):
+        return "mail.acme.example"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setattr(
+        ef.aiosmtplib, "SMTP",
+        lambda *a, **kw: FakeSMTP({"jane.doe@acme.example": 250, "*": 550}))
+
+    async def revoked_reoon(email, key):
+        raise ef.VerifierUnavailable("Reoon HTTP 403")
+
+    monkeypatch.setattr(ef, "verify_reoon", revoked_reoon)
+
+    result = await ef.find_email(
+        "Jane", "Doe", "acme.example", env=Env(reoon="k"), state=state)
+    assert result.status == "verified"  # SMTP accepted, control said not catch-all
+    assert result.mx_type == "other"
+
+
+@pytest.mark.asyncio
+async def test_small_host_dead_hunter_and_silent_smtp_stay_guess(state, monkeypatch):
+    async def mx(domain):
+        return "mail.acme.example"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+
+    async def unreachable(domain, key):
+        raise ef.HunterUnavailable("test")
+
+    monkeypatch.setattr(ef, "_hunter_domain_pattern", unreachable)
+    _use_smtp(monkeypatch, {}, fail_connect=True)
+    monkeypatch.setattr(ef, "get_mx_host", mx)  # _use_smtp pointed at google
+
+    async def exhausted_hunter(email, key):
+        raise ef.VerifierUnavailable("Hunter HTTP 429")
+
+    monkeypatch.setattr(ef, "verify_hunter", exhausted_hunter)
+
+    result = await ef.find_email("Jane", "Doe", "acme.example", env=Env(), state=state)
+    assert result.status == "guess"  # a dead key never becomes "invalid"
+
+
+# ── the verifier APIs themselves: dead key vs silent channel ──
+
+
+class HTTPReply:
+    def __init__(self, status_code, body=None):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not JSON")
+        return self._body
+
+
+def _http(monkeypatch, status_code, body=None):
+    reply = HTTPReply(status_code, body)
+
+    class Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None):
+            return reply
+
+    monkeypatch.setattr(ef.httpx, "AsyncClient", Client)
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+@pytest.mark.asyncio
+async def test_verifiers_raise_unavailable_on_auth_quota_death(monkeypatch, status):
+    _http(monkeypatch, status)
+    with pytest.raises(ef.VerifierUnavailable):
+        await ef.verify_reoon("jane.doe@acme.com", "dead-key")
+    with pytest.raises(ef.VerifierUnavailable):
+        await ef.verify_hunter("jane.doe@acme.com", "dead-key")
+    with pytest.raises(ef.VerifierUnavailable):
+        await ef.verify_zerobounce("jane.doe@acme.com", "dead-key")
+
+
+@pytest.mark.asyncio
+async def test_zerobounce_reports_a_dead_key_in_band(monkeypatch):
+    """ZeroBounce answers HTTP 200 with an 'invalid_api_key' status."""
+    _http(monkeypatch, 200, body={"status": "invalid_api_key"})
+    with pytest.raises(ef.VerifierUnavailable):
+        await ef.verify_zerobounce("jane.doe@acme.com", "dead-key")
+
+
+@pytest.mark.asyncio
+async def test_a_silent_verifier_stays_none_not_unavailable(monkeypatch):
+    """5xx is a per-address miss, not a dead channel — a reachable API that
+    can't answer must still block the probe (see the wiring tests above)."""
+    _http(monkeypatch, 503)
+    assert await ef.verify_reoon("jane.doe@acme.com", "k") is None
+    assert await ef.verify_hunter("jane.doe@acme.com", "k") is None
+    _http(monkeypatch, 200, body={"status": "unknown", "sub_status": ""})
+    assert await ef.verify_zerobounce("jane.doe@acme.com", "k") == {
+        "status": "unknown", "catch_all": False}
+
+
 @pytest.mark.asyncio
 async def test_state_backfill_query_selects_only_unconfirmed(state):
     from harvey.models.prospect import Prospect

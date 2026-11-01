@@ -15,8 +15,9 @@ brute-forcing every name permutation, this pipeline:
 3. Verifies that single candidate through the best available channel for
    the domain type: a real-verdict API (Reoon, ZeroBounce for the big
    providers), Hunter, SMTP for small self-hosted servers, or — when no key
-   is configured at all — a control-checked recipient probe against the
-   domain's own MX (see ``probe_recipient``).
+   is configured or every configured key is auth/quota-dead (401/403/429) —
+   a control-checked recipient probe against the domain's own MX (see
+   ``probe_recipient``).
 4. Detects catch-all domains and buckets them as ``risky`` instead of
    pretending they're verified.
 
@@ -74,6 +75,22 @@ WEAK_SOURCES = DEFAULT_SOURCES + ("site_address_guess", "site_address_guess_afte
 class HunterUnavailable(Exception):
     """Hunter couldn't answer right now (timeout, 429, 5xx). Transient: the
     domain is asked again later, never remembered as having no pattern."""
+
+
+# A response that means "this account cannot use the API at all", not "this
+# address couldn't be decided": 401 missing/expired key, 403 revoked key
+# (how Reoon answers a dead one), 429 quota or rate exhausted (Hunter's
+# monthly lapse). Any other non-200 stays a per-address miss.
+AUTH_QUOTA_STATUSES = frozenset({401, 403, 429})
+
+
+class VerifierUnavailable(Exception):
+    """A verifier API refused to serve this account — auth or quota dead
+    (HTTP 401/403/429). Not a verdict about the address: the channel can't
+    answer for anyone until the key is fixed, so callers treat it like an
+    unconfigured key and fall through to the next channel, or the keyless
+    probe. A channel that stays silent or answers 'unknown' is different —
+    the API tier had its chance and the address honestly stays a guess."""
 
 
 @dataclass
@@ -511,6 +528,7 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
     """Reoon email-verifier — generous free tier, good catch-all flagging.
 
     Returns {'status': ..., 'catch_all': bool} or None if unavailable.
+    Raises VerifierUnavailable when the key itself is refused (401/403/429).
     Reoon power-mode 'status' values: safe / invalid / disabled / disposable /
     inbox_full / catch_all / role_account / spamtrap / unknown. 'safe' is its
     deliverable verdict; a 'role_account' (info@, office@) counts as valid
@@ -525,6 +543,8 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
     except httpx.HTTPError as e:
         logger.debug(f"Reoon request failed for {email}: {e}")
         return None
+    if resp.status_code in AUTH_QUOTA_STATUSES:
+        raise VerifierUnavailable(f"Reoon HTTP {resp.status_code}")
     if resp.status_code != 200:
         return None
     try:
@@ -541,7 +561,11 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
 
 
 async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
-    """ZeroBounce — its 2026 engine is the reliable one for M365/Workspace catch-alls."""
+    """ZeroBounce — its 2026 engine is the reliable one for M365/Workspace catch-alls.
+
+    Raises VerifierUnavailable when the key itself is refused: 401/403/429,
+    or the in-band 'invalid_api_key' status."""
+
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             resp = await client.get(
@@ -551,6 +575,8 @@ async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
     except httpx.HTTPError as e:
         logger.debug(f"ZeroBounce request failed for {email}: {e}")
         return None
+    if resp.status_code in AUTH_QUOTA_STATUSES:
+        raise VerifierUnavailable(f"ZeroBounce HTTP {resp.status_code}")
     if resp.status_code != 200:
         return None
     try:
@@ -560,6 +586,10 @@ async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
     status = str(data.get("status") or "").lower()
+    if "api" in status and "key" in status:
+        # ZeroBounce also reports a dead key in-band, HTTP 200 and a status
+        # like 'invalid_api_key' — same meaning as a 401.
+        raise VerifierUnavailable(f"ZeroBounce status {status!r}")
     sub = str(data.get("sub_status") or "").lower()
     return {"status": status, "catch_all": sub == "catch-all" or status == "catch-all"}
 
@@ -574,6 +604,8 @@ async def verify_hunter(email: str, api_key: str) -> Optional[dict]:
     except httpx.HTTPError as e:
         logger.debug(f"Hunter verify failed for {email}: {e}")
         return None
+    if resp.status_code in AUTH_QUOTA_STATUSES:
+        raise VerifierUnavailable(f"Hunter HTTP {resp.status_code}")
     if resp.status_code != 200:
         return None
     try:
@@ -725,7 +757,9 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
     # last resort: with no key configured at all the candidate would stay a
     # "guess" forever, so a control-checked recipient probe is allowed to
     # answer instead (probe_recipient refuses to guess — it needs the control
-    # address to be rejected before it will call anything valid).
+    # address to be rejected before it will call anything valid). A key the
+    # API refuses to honour — 401/403/429 — counts as no key, so a quota
+    # lapse can't freeze every new address as "guess" until the key is fixed.
     if mx_type in ("google", "microsoft", "gateway"):
         channels = []
         if zerobounce_key:
@@ -734,8 +768,15 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
             channels.append(lambda: verify_reoon(email, reoon_key))
         if hunter_key:
             channels.append(lambda: verify_hunter(email, hunter_key))
+        dead = 0  # channels whose key was refused outright (auth/quota)
         for channel in channels:
-            verdict = await channel()
+            try:
+                verdict = await channel()
+            except VerifierUnavailable as e:
+                dead += 1
+                logger.info(
+                    "Verifier channel unusable for %s (%s); trying next", email, e)
+                continue
             if verdict is None:
                 continue
             if verdict.get("catch_all"):
@@ -743,7 +784,16 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
             status = _status_from_verdict(verdict)
             if status is not None:
                 return status, catch_all_seen
-        if not channels and getattr(env, "smtp_probe", True):
+        # dead == len(channels) holds with no channels at all too: the probe
+        # answers when the API tier had no chance to — no key configured, or
+        # every configured key auth/quota-dead. A channel that went silent
+        # or said "unknown" still leaves an honest "guess" (no cheating with
+        # port 25 around a working verifier).
+        if dead == len(channels) and getattr(env, "smtp_probe", True):
+            if channels:
+                logger.warning(
+                    "Every verifier key for %s is auth/quota-dead — answering "
+                    "with the keyless MX probe", email)
             verdict = await probe_recipient(email)
             if verdict:
                 if verdict.get("catch_all"):
@@ -755,7 +805,11 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
 
     # Small / self-hosted: Reoon → SMTP (still works here) → Hunter.
     if reoon_key:
-        verdict = await verify_reoon(email, reoon_key)
+        try:
+            verdict = await verify_reoon(email, reoon_key)
+        except VerifierUnavailable as e:
+            logger.info("Reoon unusable for %s (%s); continuing to SMTP", email, e)
+            verdict = None
         if verdict:
             if verdict.get("catch_all"):
                 catch_all_seen = True
@@ -773,7 +827,11 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
         return "invalid", catch_all_seen
 
     if hunter_key:
-        verdict = await verify_hunter(email, hunter_key)
+        try:
+            verdict = await verify_hunter(email, hunter_key)
+        except VerifierUnavailable as e:
+            logger.info("Hunter unusable for %s (%s)", email, e)
+            verdict = None
         if verdict:
             if verdict.get("catch_all"):
                 catch_all_seen = True
