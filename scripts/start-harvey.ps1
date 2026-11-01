@@ -75,5 +75,15 @@ if ($DryRun) {
 
 Write-GuardLog "no heartbeat running - starting harvey.exe run"
 $env:PYTHONUTF8 = '1'
-& $harveyExe run *>> $logPath
+# Run the loop through cmd.exe so its logging never becomes a PowerShell
+# error record: Harvey logs to stderr, and under $ErrorActionPreference =
+# 'Stop' plus the task-level `2>&1` redirect, PS 5.1 turns the first stderr
+# line into a terminating NativeCommandError that kills this launcher and
+# the loop with it (seen 2026-10-29: every fresh loop died on its banner
+# line, task result 1). No path here contains spaces, so no inner quoting.
+if ($harveyExe -match '\s' -or $logPath -match '\s') {
+    Write-GuardLog "FATAL: path with spaces not supported: $harveyExe / $logPath"
+    exit 4
+}
+& cmd.exe /s /c "$harveyExe run >> $logPath 2>&1"
 exit $LASTEXITCODE
