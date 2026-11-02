@@ -59,6 +59,24 @@ PATTERN_BUILDERS = {
     "{l}{fi}": lambda f, l: f"{l}{f[0]}",
 }
 DEFAULT_PATTERN = "{f}.{l}"
+
+# When a *guessed* format is verified and the verifier says the mailbox does
+# not exist, the guess was simply the wrong format for that domain (first@,
+# jsmith@ instead of first.last@), and the person is left holding a dead
+# address. Measured 2026-10-29: 16 of 20 new prospects were pattern guesses
+# that Reoon graded invalid. So one invalid verdict buys the next formats a
+# try, cheapest-first, and the person keeps the first mailbox that verifies.
+# Only formats carrying BOTH names are tried: `{f}` alone (nalini@) or `{l}`
+# alone (kembhavi@) could be a different person at the same company, and a
+# verifier would happily confirm *that* mailbox as live.
+VARIANT_PATTERN_ORDER = ("{f}{l}", "{fi}{l}", "{fi}.{l}", "{f}_{l}",
+                         "{f}-{l}", "{l}.{f}", "{l}{fi}")
+DEFAULT_PATTERN_VARIANTS = 2
+# Confidence at which a pattern stops being a guess and becomes evidence the
+# site itself published (an address tied to a named person, or Hunter with
+# several backing examples). Retrying a variant would then be noise.
+PATTERN_EVIDENCE_CONFIDENCE = 0.85
+
 # A business with a handful of people and no evidence of its format: the
 # owner of a five-person roofing company is lou@, far more often than
 # lou.smith@. Still only a guess — never sent until a verifier confirms it.
@@ -133,6 +151,87 @@ def generate_patterns(first_name: str, last_name: str, domain: str) -> list[str]
         if email:
             out.append(email)
     return list(dict.fromkeys(out))
+
+
+def pattern_variant_tries() -> int:
+    """How many extra formats one invalid verdict may buy (env-tunable).
+
+    ``HARVEY_PATTERN_VARIANTS=0`` turns the retry off entirely; the default
+    of 2 spends at most two more verifier calls per dead guess.
+    """
+    raw = os.getenv("HARVEY_PATTERN_VARIANTS", "").strip()
+    if not raw:
+        return DEFAULT_PATTERN_VARIANTS
+    try:
+        return max(0, min(int(raw), len(VARIANT_PATTERN_ORDER)))
+    except ValueError:
+        return DEFAULT_PATTERN_VARIANTS
+
+
+def _pattern_is_evidence(source: str, confidence: float) -> bool:
+    """True when the domain's format was observed, not merely guessed."""
+    return source == "known_email" or (confidence or 0) >= PATTERN_EVIDENCE_CONFIDENCE
+
+
+@dataclass
+class VariantResult:
+    """What the second-format attempt found. status None = decided nothing."""
+    email: str = ""
+    status: Optional[str] = None
+    pattern: str = ""
+    catch_all: bool = False
+    tried: list[str] = field(default_factory=list)
+
+
+async def verify_alternative_patterns(
+    first_name: str,
+    last_name: str,
+    domain: str,
+    mx_type: str,
+    env=None,
+    *,
+    tried: list[str],
+    person: tuple[str, str],
+    other_people=None,
+    known_emails=None,
+    limit: Optional[int] = None,
+) -> VariantResult:
+    """Verify the next most likely formats after ``tried`` came back invalid.
+
+    Returns the first candidate a verifier accepts (verified or risky) as
+    ``VariantResult``; when nothing is accepted, ``status`` is None and
+    ``tried`` lists every address sent to the verifier. An address another
+    named person at the company could own is never verified here — that
+    would confirm someone else's mailbox and put this person's name on it.
+    """
+    variants = [
+        (pattern, build_email(pattern, first_name, last_name, domain))
+        for pattern in VARIANT_PATTERN_ORDER
+    ]
+    tried = list(tried or [])
+    out = VariantResult(tried=tried)
+    seen = {t.lower() for t in tried}
+    budget = pattern_variant_tries() if limit is None else max(0, int(limit))
+    for pattern, candidate in variants:
+        if budget <= 0:
+            break
+        if not candidate or candidate.lower() in seen:
+            continue
+        if _belongs_to_someone_else(candidate, pattern, person, domain,
+                                    other_people, known_emails):
+            continue
+        budget -= 1
+        tried.append(candidate)
+        out.tried = tried
+        status, catch_all = await _verify_candidate(candidate, mx_type, env)
+        if catch_all:
+            out.catch_all = True
+        if status in ("verified", "risky"):
+            logger.info(f"Alternate pattern for {first_name} {last_name}@{domain}: "
+                        f"{candidate} [{status}]")
+            out.email, out.status, out.pattern = candidate, status, pattern
+            return out
+    return out
 
 
 # ── MX classification ──
@@ -980,6 +1079,10 @@ async def find_email(
     person's own published address (in ``known_emails``) is used as is,
     and is still graded like any other.
 
+    When the format was only a guess and the verifier says the mailbox does
+    not exist, the next most likely formats are verified too (see
+    ``verify_alternative_patterns``) before the person is written off.
+
     ``other_people`` are the other people named at the company. A candidate
     one of them could own (jsmith@ for Jane when John Smith works there too,
     or an address published as theirs) is never guessed or verified for
@@ -1002,11 +1105,13 @@ async def find_email(
     )
     candidate = build_email(pattern, first_name, last_name, domain)
     own = _clean_name_part(first_name), _clean_name_part(last_name)
+    own_published = False
     for email, first, last in known_emails or []:
         if (_clean_name_part(first), _clean_name_part(last)) == own \
                 and email.split("@")[-1].lower() == domain:
             candidate = email.strip().lower()
             pattern = infer_pattern_from_email(candidate, first, last) or pattern
+            own_published = True
             break
     if _belongs_to_someone_else(candidate, pattern, (first_name, last_name), domain,
                                 other_people, known_emails):
@@ -1031,6 +1136,32 @@ async def find_email(
 
     status, catch_all = await _verify_candidate(candidate, mx_type, env)
 
+    variants: list[str] = [candidate]
+    if status == "invalid" and not own_published and not _pattern_is_evidence(source, confidence):
+        # The format was a guess and the guess was wrong. Buy the next
+        # formats a verification before writing the person off.
+        alt = await verify_alternative_patterns(
+            first_name, last_name, domain, mx_type, env,
+            tried=variants, person=(first_name, last_name),
+            other_people=other_people, known_emails=known_emails,
+        )
+        variants = alt.tried
+        if alt.status in ("verified", "risky"):
+            if alt.catch_all and state is not None:
+                try:
+                    await state.save_email_pattern(domain, mx_type=mx_type, is_catch_all=1)
+                except Exception:
+                    pass
+            logger.info(f"Email for {first_name} {last_name}@{domain}: {alt.email} "
+                        f"[{alt.status}] (pattern {alt.pattern}, alternate)")
+            return EmailResult(
+                email=alt.email, status=alt.status, pattern=alt.pattern,
+                mx_type=mx_type,
+                evidence={"variants_tried": variants, "rejected": candidate},
+            )
+        if alt.catch_all:
+            catch_all = True
+
     if catch_all and state is not None:
         try:
             await state.save_email_pattern(domain, mx_type=mx_type, is_catch_all=1)
@@ -1041,8 +1172,12 @@ async def find_email(
         # Verification couldn't decide — an honest guess, never "verified".
         status = "guess"
 
-    logger.info(f"Email for {first_name} {last_name}@{domain}: {candidate} [{status}]")
-    return EmailResult(email=candidate, status=status, pattern=pattern, mx_type=mx_type)
+    logger.info(f"Email for {first_name} {last_name}@{domain}: {candidate} [{status}]"
+                + (f" ({len(variants)} formats tried)" if len(variants) > 1 else ""))
+    return EmailResult(
+        email=candidate, status=status, pattern=pattern, mx_type=mx_type,
+        evidence={"variants_tried": variants} if len(variants) > 1 else {},
+    )
 
 
 async def verify_address(

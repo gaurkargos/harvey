@@ -31,6 +31,7 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import parse_qs, quote_plus, urlparse
 
 import httpx
@@ -96,7 +97,18 @@ LOCAL_BUSINESS_SOURCES = ("discover:osm", "discover:dataforseo_listings")
 INBOX_PAGES = ("/contact", "/contact-us")
 INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
                    "team", "service", "sales", "estimates", "quotes",
-                   "inquiries", "enquiries", "admin", "support")
+                   "inquiries", "enquiries", "admin", "support",
+                   # Published by real prospects whose named owners were
+                   # unreachable: connect@studiosalt.in, partnership@ and
+                   # support@ihubgujarat.in (probed 2026-10-30).
+                   "connect", "partnership", "partner", "enquiry")
+# A company with one of these on file is already reached; its inbox would
+# only be a second way in. Anything weaker (a guessed, invalid or missing
+# address) leaves it unreached — on 2026-10-29 sixteen of twenty new
+# prospects were pattern guesses verification threw out, and the published
+# inbox that could have replaced them was never tried, because the dead
+# rows themselves counted as "contacted".
+REACHABLE_EMAIL_STATUSES = ("verified", "risky")
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -126,6 +138,26 @@ _SENIOR_KEYWORDS = (
     "co-founder", "president", "owner", "partner", "vp", "vice president",
     "svp", "evp", "head of", "director",
 )
+
+
+def inbox_rank(local: str) -> Optional[int]:
+    """How owner-like a published local part is, or None if it isn't one.
+
+    Plain forms rank first in ``INBOX_PREFERRED`` order, then mailboxes
+    scoped to an office or region (``info.blr@``, ``office-delhi@``,
+    ``contact_uk@``): a plain info@ is the central front desk, a scoped one
+    is whichever branch happened to publish its address. A name never ranks
+    (``jane.doe@`` is a person; ``kaf.blr@`` is a branch Harvey didn't pick),
+    which is what keeps a personal address out of the company inbox.
+    """
+    local = (local or "").strip().lower()
+    if not local:
+        return None
+    head = re.split(r"[._\-]", local)[0]
+    if head not in INBOX_PREFERRED:
+        return None
+    offset = 0 if local == head else len(INBOX_PREFERRED)
+    return offset + INBOX_PREFERRED.index(head)
 
 
 class Scout:
@@ -857,13 +889,43 @@ class Scout:
                 if not company:
                     continue
 
+                # A company name alone is still a dead prospect: with no
+                # domain there is no company row, no learnable email
+                # pattern, and nothing to verify or send. Resolve the name
+                # to a domain and attach the company before saving; skip
+                # when nothing resolves.
+                domain = ""
+                try:
+                    domain = await self._guess_domain(company)
+                except Exception:
+                    domain = ""
+                if not domain:
+                    continue
+                company_id = await self._ensure_company(
+                    name=company,
+                    domain=domain,
+                    industry=industry,
+                    source="web_search",
+                    source_url=url,
+                )
+
+                email, email_status = await self._resolve_email(
+                    parsed.get("first_name", ""),
+                    parsed.get("last_name", ""),
+                    domain,
+                )
+
                 prospect = Prospect(
                     first_name=parsed.get("first_name", ""),
                     last_name=parsed.get("last_name", ""),
+                    email=email,
+                    email_status=email_status,
+                    email_verified=(email_status == "verified"),
                     linkedin_url=url,
                     title=title,
                     seniority=self._infer_seniority(title),
                     company=company,
+                    company_id=company_id,
                     industry=industry,
                     source="web_search",
                     source_url=url,
@@ -1680,7 +1742,7 @@ Respond ONLY with the JSON array."""
         # only a guess (never sent). A named person found here who is
         # already a prospect (a revisit), or anyone already on file from
         # another source, means the company is covered.
-        reachable = any(c.email_status in ("verified", "risky") for c in contacts)
+        reachable = any(c.email_status in REACHABLE_EMAIL_STATUSES for c in contacts)
         if not reachable and (contacts or not named_on_site) \
                 and await self._company_uncontacted(company_id):
             inbox = await self._company_inbox_prospect(
@@ -1716,23 +1778,34 @@ Respond ONLY with the JSON array."""
             logger.debug(f"LIKELY_OWNER observation failed for {company_id}: {e}")
 
     async def _company_uncontacted(self, company_id: str) -> bool:
-        """True only when the company is on file and has no prospects yet."""
+        """True when nothing on file for the company can be emailed at all.
+
+        Not "no prospects yet": a company whose only rows are pattern guesses
+        a verifier threw out (invalid) or couldn't decide (guess) is still
+        unreached, and its published inbox is the address that works.
+        """
         if not company_id:
             return False
         try:
-            return not await self.state.get_contacts_for_company(company_id)
+            contacts = await self.state.get_contacts_for_company(company_id)
         except Exception as e:
             logger.debug(f"Contact lookup failed for company {company_id}: {e}")
             return False
+        return not any(
+            (p.email_status or "guess") in REACHABLE_EMAIL_STATUSES for p in contacts
+        )
 
     async def _company_inbox_prospect(
         self, company_id: str, domain: str, company_name: str,
         industry: str, signal_note: str = "",
     ) -> Prospect | None:
-        """The company's own published inbox, when its site names nobody.
+        """The company's own published inbox, when no named contact works.
 
         Small trade businesses rarely list a team, but most publish an
         info@ or office@ address that the owner or office manager reads.
+        The same inbox is the fallback for a company that does list people
+        whose addresses are only guesses — a pattern guess the verifier
+        rejected is not a reason to write the company off.
         Only an address printed on the company's own site is used, never a
         guessed one, and it is verified like any other before sending.
         """
@@ -1759,7 +1832,7 @@ Respond ONLY with the JSON array."""
         if not prospect.is_valid() or await self._is_duplicate_prospect(prospect):
             return None
         self._remember_prospect(prospect)
-        logger.info(f"Scout: No named owner at {domain}; using its published inbox {email} [{status}]")
+        logger.info(f"Scout: No reachable contact at {domain}; using its published inbox {email} [{status}]")
         return prospect
 
     async def _find_inbox_address(self, domain: str) -> str:
@@ -1789,16 +1862,17 @@ Respond ONLY with the JSON array."""
         for _, text in pages:
             for addr in people_mod.emails_on_page(text):
                 local, _, adomain = addr.partition("@")
-                if local not in INBOX_PREFERRED or addr in candidates:
+                rank = inbox_rank(local)
+                if rank is None or any(addr == seen for _, seen in candidates):
                     continue
                 adomain = adomain.removeprefix("www.")
                 if adomain != domain and not adomain.endswith("." + domain) \
                         and not await self._is_own_domain(adomain, site):
                     continue
-                candidates.append(addr)
+                candidates.append((rank, addr))
         if not candidates:
             return ""
-        return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
+        return min(candidates)[1]
 
     async def _is_own_domain(self, other: str, site: dict) -> bool:
         """Is ``other`` the business's own second domain? True when its

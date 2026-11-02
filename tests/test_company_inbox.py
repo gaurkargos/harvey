@@ -176,6 +176,23 @@ async def test_published_address_is_cleaned(html):
     assert await make_scout({"https://acme.com": html})._find_inbox_address("acme.com") == "info@acme.com"
 
 
+@pytest.mark.parametrize("html, expected", [
+    # published by real prospects whose named owners were unreachable
+    ("write to connect@acme.com", "connect@acme.com"),
+    ("partnership@acme.com for partners", "partnership@acme.com"),
+    # an office-scoped mailbox is still the team, one branch further away
+    ("kaf.blr@acme.com", ""),                      # a branch, not a function
+    ("info.blr@acme.com", "info.blr@acme.com"),
+    ("office-delhi@acme.com", "office-delhi@acme.com"),
+    # the plain form always beats a scoped one
+    ("office.blr@acme.com info@acme.com", "info@acme.com"),
+])
+@pytest.mark.asyncio
+async def test_inbox_allowlist_and_office_scoped_mailboxes(html, expected):
+    pages = {"https://acme.com": html}
+    assert await make_scout(pages)._find_inbox_address("acme.com") == expected
+
+
 # ── fallback only when the company has nobody ──
 
 def fallback_scout(team, existing=(), duplicate=False):
@@ -230,12 +247,35 @@ async def test_no_inbox_when_the_named_owner_is_already_a_prospect():
 
 
 @pytest.mark.asyncio
-async def test_no_inbox_when_the_company_already_has_a_contact():
-    # Someone at the company came from another source (LinkedIn, a job board).
-    known = Prospect(first_name="Jo", last_name="Li", title="Owner", email="jo@acme.com")
+async def test_no_inbox_when_the_company_already_has_a_verified_contact():
+    # Someone at the company came from another source (LinkedIn, a job board)
+    # with an address that already works: info@ would be a second way in.
+    known = Prospect(first_name="Jo", last_name="Li", title="Owner",
+                     email="jo@acme.com", email_status="verified")
     scout = fallback_scout(team=[], existing=[known])
     assert await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing") == []
     assert scout.inbox_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_inbox_used_when_the_only_contact_on_file_is_an_unusable_guess():
+    # A pattern guess a verifier threw out is not a way in: the company is
+    # still unreached and its published inbox is the address that works.
+    dead = Prospect(first_name="Jo", last_name="Li", title="Owner",
+                    email="jo.li@acme.com", email_status="invalid")
+    scout = fallback_scout(team=[], existing=[dead])
+    contacts = await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing")
+    assert [p.is_company_inbox for p in contacts] == [True]
+    assert scout.inbox_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_guessed_contact_does_not_block_the_published_inbox():
+    unconfirmed = Prospect(first_name="Jo", last_name="Li", title="Owner",
+                           email="jo.li@acme.com", email_status="guess")
+    scout = fallback_scout(team=[], existing=[unconfirmed])
+    contacts = await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing")
+    assert [p.is_company_inbox for p in contacts] == [True]
 
 
 @pytest.mark.asyncio

@@ -288,6 +288,40 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A dead format guess buys the next one before the person is written off.**
+  When the email format came only from the domain's usual habit and the
+  verifier said the mailbox does not exist, Harvey kept the dead address and
+  the person was unreachable: on 2026-10-29 sixteen of twenty new prospects
+  were pattern guesses a verifier graded `invalid`. One `invalid` verdict now
+  spends up to two more verifier calls on the next likeliest formats that
+  carry both names (`{f}{l}`, `{fi}{l}`, `{fi}.{l}`, …), and the person keeps
+  the first mailbox that verifies. A format the site published for that
+  person is evidence, not a guess, so its `invalid` stays final; a candidate
+  another named person at the company could own is never tried. Tune or turn
+  it off with `HARVEY_PATTERN_VARIANTS` (default `2`, `0` disables). Every
+  attempt is named in the result's `evidence.variants_tried`.
+- **A company with only dead addresses is reached through its published
+  inbox.** The Scout's inbox fallback used to fire only when the company had
+  *no* prospects at all, so a company whose only row was a pattern guess the
+  verifier threw out never got its `info@` (or `connect@`, `partnership@`)
+  tried. The fallback now checks whether anything on file is actually
+  emailable (`verified`/`risky`), and same-domain office mailboxes
+  (`info.blr@`, `office-delhi@`) rank behind the plain forms instead of being
+  ignored. A personal name never becomes the company inbox.
+- **LinkedIn hits are resolved to a company domain before they are saved.**
+  A profile search result with a company name but no domain produced a
+  prospect with no email, no company row and no way for any later stage to
+  move it: 32 such orphan rows were inflating every `new` count. The Scout
+  now resolves the company name to a domain, attaches the company, and
+  resolves the person's address against that domain in the same pass; a name
+  that resolves to nothing is skipped instead of stored dead.
+- **Prospects that can never be emailed are retired, not parked in `new`.**
+  A `new` prospect with no address and no company row has no domain, so no
+  pattern can be learned and no verifier has anything to check. After seven
+  days the heartbeat moves such rows to `undeliverable` (kept, not deleted,
+  with a `retired_undeliverable` action-log entry), so the counts the
+  heartbeat and dashboard decide from are true. Rows with a company but no
+  address are left alone — they can still gain one.
 - **Policy-style SMTP refusals are no longer read as "invalid".** Providers
   like Zoho answer RCPT from residential/dynamic IPs with `550 5.7.1 Mail
   rejected ... for policy reasons. We generally do not accept email from
