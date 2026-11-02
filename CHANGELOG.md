@@ -322,6 +322,21 @@ minor versions can still change behaviour.
   with a `retired_undeliverable` action-log entry), so the counts the
   heartbeat and dashboard decide from are true. Rows with a company but no
   address are left alone — they can still gain one.
+- **A dead verifier key no longer freezes every new address at "guess".** The
+  keyless control-checked MX probe only ran when *no* verifier key was
+  configured, so one key the API refuses to honour — Reoon's `403` for a
+  revoked key, Hunter's `429` when the monthly quota is spent, any `401` —
+  made every channel return nothing and left the probe unreachable until
+  someone fixed the key. That lapse recurs every month. An auth/quota
+  refusal is now `VerifierUnavailable`, treated like an unconfigured key:
+  the next channel is tried, and when every configured key is dead the probe
+  answers on Google / Microsoft / gateway MX. A channel that is merely
+  silent (5xx, timeout) or that answers "unknown" still leaves an honest
+  "guess" — the probe remains a fallback for an unreachable verifier, not a
+  way around a working one — and `HARVEY_SMTP_PROBE=0` still turns it off.
+  Self-hosted domains keep their Reoon → SMTP → Hunter order, so a dead
+  Reoon key just means SMTP answers.
+
 - **Policy-style SMTP refusals are no longer read as "invalid".** Providers
   like Zoho answer RCPT from residential/dynamic IPs with `550 5.7.1 Mail
   rejected ... for policy reasons. We generally do not accept email from
