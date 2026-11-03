@@ -350,3 +350,77 @@ async def test_derive_pattern_spends_and_respects_hunter_budget(state, monkeypat
     _, source, _ = await derive_pattern("second-co.com", state=state)
     assert source == "default"
     assert calls == ["first-co.com"]
+
+
+# ── shared monthly verifier-API budget ──
+
+
+@pytest.mark.asyncio
+async def test_verifier_budget_is_uncapped_by_default(state, monkeypatch):
+    monkeypatch.delenv("HARVEY_MONTHLY_VERIFICATIONS", raising=False)
+    assert await ef.verifications_remaining(state) is None
+    # calls are still recorded, so the spend is visible the day a cap is set
+    await ef.record_verifier_call(state)
+    assert await ef.verifications_remaining(state) is None
+
+
+@pytest.mark.asyncio
+async def test_verifier_budget_follows_the_env_setting(state, monkeypatch):
+    monkeypatch.setenv("HARVEY_MONTHLY_VERIFICATIONS", "80")
+    assert await ef.verifications_remaining(state) == 80
+    await ef.record_verifier_call(state)
+    assert await ef.verifications_remaining(state) == 79
+
+
+@pytest.mark.asyncio
+async def test_verifier_budget_is_persisted_not_in_process(state, monkeypatch):
+    """The counter lives in the DB, so a heartbeat restart or a separate
+    `harvey verify-emails` run cannot evade it."""
+    monkeypatch.setenv("HARVEY_MONTHLY_VERIFICATIONS", "2")
+    await ef.record_verifier_call(state)
+    # a fresh "process" reading the same store sees the spend
+    assert await ef.verifications_remaining(state) == 1
+
+
+@pytest.mark.asyncio
+async def test_spent_budget_halts_verifier_calls_mid_sweep(state, monkeypatch):
+    """One API call goes out, the budget hits zero, no further format is
+    verified — the burst that burned Hunter's 100 in a day can't recur."""
+    monkeypatch.setattr(ef, "get_mx_host", google_mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setenv("HARVEY_MONTHLY_VERIFICATIONS", "1")
+    calls = variant_env(monkeypatch, {"jdoe@acme.com": "valid"})
+
+    result = await find_email("Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+
+    assert calls == ["jane.doe@acme.com"]   # only the first format reached the API
+    assert result.status == "invalid"       # honest: unverified, not guessed-at
+
+
+@pytest.mark.asyncio
+async def test_spent_budget_falls_through_to_the_keyless_probe(state, monkeypatch):
+    """A spent budget behaves like a refused key: the probe answers, so
+    addresses don't freeze as 'guess' for the rest of the month."""
+    async def mx(domain):
+        return "aspmx.l.google.com"
+
+    monkeypatch.setattr(ef, "get_mx_host", mx)
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "")
+    monkeypatch.setenv("HARVEY_MONTHLY_VERIFICATIONS", "0")
+    calls = []
+
+    async def fake_probe(email):
+        calls.append(email)
+        return {"status": "valid", "catch_all": False,
+                "evidence": {"control": 550, "candidate": 250}}
+
+    monkeypatch.setattr(ef, "probe_recipient", fake_probe)
+
+    async def never_reoon(email, key):
+        raise AssertionError("budget spent — the API must not be called")
+
+    monkeypatch.setattr(ef, "verify_reoon", never_reoon)
+
+    result = await find_email("Jane", "Doe", "acme.com", env=Env(reoon="k"), state=state)
+    assert result.status == "verified"
+    assert calls == ["jane.doe@acme.com"]

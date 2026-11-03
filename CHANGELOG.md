@@ -9,6 +9,18 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Monthly cap on verifier API calls** (`HARVEY_MONTHLY_VERIFICATIONS`).
+  Hunter domain-searches already shared one monthly budget; the verifier
+  calls (Reoon / ZeroBounce / Hunter email-verifier) did not, and an
+  uncapped burst is how a free tier burns in a day. Every verifier API call
+  now spends one DB-persisted counter — shared across providers, across
+  heartbeat restarts and across separate `harvey verify-emails` runs — and
+  when it is spent, the channel is skipped exactly like a refused key, so
+  the keyless MX probe answers instead of every new address freezing as
+  "guess". Unset (the default) means uncapped, so a 600/month Reoon
+  allowance is untouched; calls are still counted, so the spend is visible
+  the day a cap is set mid-month.
+
 - **Your own email shape** (`writer.email_rules`). Point it at a markdown file
   (`skills/email_rules.md` is gitignored) and its rules replace the Writer's
   built-in shape, which ends every prompt and so beat anything in the skills:

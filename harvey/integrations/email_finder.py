@@ -206,6 +206,7 @@ async def verify_alternative_patterns(
     domain: str,
     mx_type: str,
     env=None,
+    state=None,
     *,
     tried: list[str],
     person: tuple[str, str],
@@ -240,7 +241,7 @@ async def verify_alternative_patterns(
         budget -= 1
         tried.append(candidate)
         out.tried = tried
-        status, catch_all = await _verify_candidate(candidate, mx_type, env)
+        status, catch_all = await _verify_candidate(candidate, mx_type, env, state)
         if catch_all:
             out.catch_all = True
         if status in ("verified", "risky"):
@@ -528,6 +529,70 @@ async def record_hunter_search(state) -> None:
         await state.increment_setting(_hunter_usage_key())
     except Exception as e:
         logger.debug(f"Hunter usage write failed: {e}")
+
+
+# Verifier API calls (Reoon / ZeroBounce / Hunter email-verifier) draw from
+# one SHARED monthly budget, not one per provider: Harvey falls through the
+# channels inside a single candidate, and an uncapped burst on any of them
+# is how a free tier burns in a day (Hunter's 100 verifications went on
+# 2026-10-27). HARVEY_MONTHLY_VERIFICATIONS caps the total; unset (the
+# default) leaves it uncapped so a 600/month Reoon allowance is untouched.
+# Like the searches counter it is DB-persisted, so heartbeat restarts and
+# separate `harvey verify-emails` runs cannot evade it.
+def _monthly_verifications_cap() -> Optional[int]:
+    raw = os.getenv("HARVEY_MONTHLY_VERIFICATIONS", "").strip()
+    if not raw:
+        return None  # uncapped unless the operator says otherwise
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return None
+
+
+def _verifier_usage_key() -> str:
+    return f"verifier_call_count:{datetime.now(timezone.utc):%Y-%m}"
+
+
+async def verifications_remaining(state) -> Optional[int]:
+    """Verifier API calls left this calendar month (UTC), or None when
+    uncapped. Without a state store there is nothing to count against, so
+    the full cap is reported."""
+    cap = _monthly_verifications_cap()
+    if cap is None:
+        return None
+    if state is None:
+        return cap
+    try:
+        used = int(await state.get_setting(_verifier_usage_key(), "0") or "0")
+    except (ValueError, TypeError):
+        used = 0
+    except Exception as e:
+        logger.debug(f"Verifier usage read failed: {e}")
+        return 0
+    return max(cap - used, 0)
+
+
+async def record_verifier_call(state) -> None:
+    """Count one verifier API call against this month's budget. Called even
+    when uncapped, so the spend is visible the day a cap is set mid-month.
+    Called before the request, so a call that fails mid-flight is still
+    counted."""
+    if state is None:
+        return
+    try:
+        await state.increment_setting(_verifier_usage_key())
+    except Exception as e:
+        logger.debug(f"Verifier usage write failed: {e}")
+
+
+async def _spend_verification(state) -> bool:
+    """Reserve one verifier API call. False when this month's budget (if
+    any) is already spent — the caller must not make the request."""
+    remaining = await verifications_remaining(state)
+    if remaining is not None and remaining <= 0:
+        return False
+    await record_verifier_call(state)
+    return True
 
 
 async def hunter_domain_people(
@@ -839,11 +904,17 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
     return None  # unknown / risky-unknown — inconclusive
 
 
-async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str], bool]:
+async def _verify_candidate(
+    email: str, mx_type: str, env, state=None
+) -> tuple[Optional[str], bool]:
     """Run the best available verifier for this domain type.
 
     Returns (status_or_None, catch_all_seen). Order is chosen so scarce
     paid-ish credits are spent only where they actually resolve the domain.
+    Every Reoon/ZeroBounce/Hunter call spends the shared monthly budget
+    (_spend_verification); a channel the budget can no longer pay for is
+    skipped like a refused key, so addresses don't freeze as "guess" for
+    the rest of the month.
     """
     reoon_key = getattr(env, "reoon_api_key", "") if env else ""
     zerobounce_key = getattr(env, "zerobounce_api_key", "") if env else ""
@@ -857,8 +928,9 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
     # "guess" forever, so a control-checked recipient probe is allowed to
     # answer instead (probe_recipient refuses to guess — it needs the control
     # address to be rejected before it will call anything valid). A key the
-    # API refuses to honour — 401/403/429 — counts as no key, so a quota
-    # lapse can't freeze every new address as "guess" until the key is fixed.
+    # API refuses to honour — 401/403/429 — or a monthly budget that is
+    # spent counts as no key, so a quota lapse can't freeze every new
+    # address as "guess" until the key is fixed.
     if mx_type in ("google", "microsoft", "gateway"):
         channels = []
         if zerobounce_key:
@@ -867,8 +939,16 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
             channels.append(lambda: verify_reoon(email, reoon_key))
         if hunter_key:
             channels.append(lambda: verify_hunter(email, hunter_key))
-        dead = 0  # channels whose key was refused outright (auth/quota)
+        # channels that could not answer: refused key (auth/quota) or a
+        # monthly budget already spent
+        dead = 0
         for channel in channels:
+            if not await _spend_verification(state):
+                logger.info(
+                    "Monthly verifier budget spent — skipping API channel "
+                    "for %s", email)
+                dead += 1
+                continue
             try:
                 verdict = await channel()
             except VerifierUnavailable as e:
@@ -884,15 +964,17 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
             if status is not None:
                 return status, catch_all_seen
         # dead == len(channels) holds with no channels at all too: the probe
-        # answers when the API tier had no chance to — no key configured, or
-        # every configured key auth/quota-dead. A channel that went silent
-        # or said "unknown" still leaves an honest "guess" (no cheating with
-        # port 25 around a working verifier).
+        # answers when the API tier had no chance to — no key configured,
+        # every configured key auth/quota-dead, or the monthly verifier
+        # budget spent. A channel that went silent or said "unknown" still
+        # leaves an honest "guess" (no cheating with port 25 around a
+        # working verifier).
         if dead == len(channels) and getattr(env, "smtp_probe", True):
             if channels:
                 logger.warning(
-                    "Every verifier key for %s is auth/quota-dead — answering "
-                    "with the keyless MX probe", email)
+                    "Every verifier channel for %s is unusable (auth/quota-dead "
+                    "or monthly budget spent) — answering with the keyless MX "
+                    "probe", email)
             verdict = await probe_recipient(email)
             if verdict:
                 if verdict.get("catch_all"):
@@ -903,7 +985,7 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
         return None, catch_all_seen
 
     # Small / self-hosted: Reoon → SMTP (still works here) → Hunter.
-    if reoon_key:
+    if reoon_key and await _spend_verification(state):
         try:
             verdict = await verify_reoon(email, reoon_key)
         except VerifierUnavailable as e:
@@ -925,7 +1007,7 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
     if smtp is False:
         return "invalid", catch_all_seen
 
-    if hunter_key:
+    if hunter_key and await _spend_verification(state):
         try:
             verdict = await verify_hunter(email, hunter_key)
         except VerifierUnavailable as e:
@@ -941,7 +1023,7 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
     return None, catch_all_seen
 
 
-async def verify_published_address(email: str, env=None) -> str:
+async def verify_published_address(email: str, env=None, state=None) -> str:
     """Grade an address the company publishes on its own website.
 
     Graded like any other address: a catch-all verdict stays "risky", so
@@ -956,7 +1038,7 @@ async def verify_published_address(email: str, env=None) -> str:
     mx_host = await get_mx_host(domain)
     if not mx_host:
         return "invalid"
-    status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
+    status, _ = await _verify_candidate(email, classify_mx(mx_host), env, state)
     return status or "guess"
 
 
@@ -1192,14 +1274,14 @@ async def find_email(
     if not verify:
         return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type)
 
-    status, catch_all = await _verify_candidate(candidate, mx_type, env)
+    status, catch_all = await _verify_candidate(candidate, mx_type, env, state)
 
     variants: list[str] = [candidate]
     if status == "invalid" and not own_published and not _pattern_is_evidence(source, confidence):
         # The format was a guess and the guess was wrong. Buy the next
         # formats a verification before writing the person off.
         alt = await verify_alternative_patterns(
-            first_name, last_name, domain, mx_type, env,
+            first_name, last_name, domain, mx_type, env, state,
             tried=variants, person=(first_name, last_name),
             other_people=other_people, known_emails=known_emails,
         )
@@ -1257,7 +1339,7 @@ async def verify_address(
         return EmailResult(email=email, status="invalid", mx_type="none")
     mx_type = classify_mx(mx_host)
 
-    status, catch_all = await _verify_candidate(email, mx_type, env)
+    status, catch_all = await _verify_candidate(email, mx_type, env, state)
 
     if catch_all and state is not None:
         try:
